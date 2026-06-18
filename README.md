@@ -148,6 +148,10 @@ curl http://localhost:11434/api/chat \
 local-llm-env/
 ├── build.sh                              # Maven-free build script
 ├── pom.xml                               # Maven build file
+├── native/                               # JNI wrapper around llama.cpp's C API
+│   ├── CMakeLists.txt
+│   ├── build.sh
+│   └── llama_jni.cpp
 └── src/main/java/dev/localllm/
     ├── Main.java                         # CLI entry point
     ├── model/
@@ -155,8 +159,14 @@ local-llm-env/
     │   └── ModelRegistry.java            # Persists registry to ~/.local-llm/models.json
     ├── runner/
     │   └── ModelRunner.java              # Runs llama.cpp as a subprocess
-    └── server/
-        └── ApiServer.java                # Ollama-compatible HTTP API server
+    ├── server/
+    │   └── ApiServer.java                # Ollama-compatible HTTP API server
+    └── jni/
+        ├── LlamaNative.java              # Raw native method declarations
+        ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
+        ├── LlamaModel.java               # High-level model wrapper (AutoCloseable)
+        ├── LlamaContext.java             # High-level inference context wrapper
+        └── LlamaDemo.java                # Minimal smoke-test CLI
 ```
 
 ## Notes
@@ -164,3 +174,75 @@ local-llm-env/
 - The registry file lives at `~/.local-llm/models.json` and persists across sessions.
 - The API server uses the JDK's built-in `com.sun.net.httpserver.HttpServer` — no extra dependencies beyond Gson.
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md), which is compatible with most modern GGUF models.
+
+## JNI Binding (`dev.localllm.jni`)
+
+In addition to the subprocess-based CLI above, this project includes a direct **JNI binding to llama.cpp's C API**, so Java code can run inference in-process (no `llama-cli` subprocess, no stdout parsing).
+
+### Why JNI
+
+llama.cpp is a C/C++ library; running models fast on CPU/GPU requires linking against it directly rather than shelling out. This binding links a small C++ JNI shim (`native/llama_jni.cpp`) against `libllama.so`, exposing model loading, tokenization, and a streaming generation loop to Java via `dev.localllm.jni.LlamaNative`.
+
+### Build steps
+
+**1. Build llama.cpp as a shared library** (one-time; not vendored in this repo, see `.gitignore`):
+
+```bash
+git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
+cd llama.cpp
+cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)" --target llama ggml
+cd ..
+```
+
+**2. Generate the JNI header and compile the Java classes:**
+
+```bash
+javac -h jni-headers -d target/classes src/main/java/dev/localllm/jni/*.java
+```
+
+**3. Build the JNI shared library** (links against `llama.cpp/build/bin/libllama.so`):
+
+```bash
+bash native/build.sh
+```
+
+This produces `native/build/libllamajni.so`, linked with an rpath back to `llama.cpp/build/bin` so `libllama.so` / `libggml*.so` resolve automatically at runtime.
+
+### Usage from Java
+
+```java
+import dev.localllm.jni.LlamaModel;
+import dev.localllm.jni.LlamaContext;
+
+try (LlamaModel model = new LlamaModel("/path/to/model.gguf", /* nGpuLayers */ 0);
+     LlamaContext ctx = model.createContext(/* nCtx */ 2048, /* nThreads */ 4)) {
+
+    // One-shot:
+    String text = ctx.generate("Once upon a time", /* nPredict */ 128, /* temperature */ 0.8f);
+
+    // Streaming:
+    ctx.generateStreaming("Once upon a time", 128, 0.8f, piece -> System.out.print(piece));
+}
+```
+
+`LlamaNative` searches for `libllamajni.so` in this order: `-Ddev.localllm.nativeLib=<file>`, `-Ddev.localllm.nativeLibDir=<dir>`, or `./native/build/libllamajni.so` relative to the working directory.
+
+### Smoke test
+
+```bash
+java -Ddev.localllm.nativeLibDir=native/build -cp target/classes \
+  dev.localllm.jni.LlamaDemo /path/to/model.gguf "Once upon a time"
+```
+
+Verified end-to-end against [`ggml-org/models/tinyllamas/stories260K.gguf`](https://huggingface.co/ggml-org/models) (a 1.2 MB test model), producing coherent greedy-sampled output.
+
+### API surface
+
+| Class | Purpose |
+|---|---|
+| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API (model/context lifecycle, tokenize, detokenize, EOG check, streaming generate) |
+| `LlamaModel` | `AutoCloseable` wrapper; loads a GGUF file, exposes tokenization helpers and `createContext()` |
+| `LlamaContext` | `AutoCloseable` wrapper bound to a model; exposes `generate()` and `generateStreaming()` |
+
+Generation uses greedy sampling when `temperature <= 0`, otherwise temperature + distribution sampling (`llama_sampler_init_temp` + `llama_sampler_init_dist`).

@@ -1,0 +1,13 @@
+# llama.cpp checkout (cloned by hand, see README) and its build output
+/llama.cpp/
+
+# native JNI build output
+/native/build/
+
+# Java build output
+/target/
+/lib/
+/jni-headers/
+
+# downloaded test models
+/models/
