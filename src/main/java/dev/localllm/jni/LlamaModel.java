@@ -1,16 +1,42 @@
 package dev.localllm.jni;
 
+import java.lang.ref.Cleaner;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * A loaded GGUF model. Thread-safe to share across contexts; not safe to use
  * after {@link #close()}.
+ *
+ * <p>The native model occupies off-heap memory the JVM's GC does not know
+ * about. Always {@link #close()} (or use try-with-resources) to free it
+ * deterministically. As a safety net for leaked instances, a {@link Cleaner}
+ * also frees the native handle when this object becomes unreachable - but
+ * that only runs at GC's discretion and must not be relied upon.
  */
 public final class LlamaModel implements AutoCloseable {
 
     private static final AtomicBoolean BACKEND_INITIALIZED = new AtomicBoolean(false);
 
+    /**
+     * Holds only the native handle - must not (transitively) reference the
+     * enclosing LlamaModel, or the instance would never become unreachable
+     * and the Cleaner would never run.
+     */
+    private static final class State implements Runnable {
+        private final long handle;
+
+        State(long handle) {
+            this.handle = handle;
+        }
+
+        @Override
+        public void run() {
+            LlamaNative.freeModel(handle);
+        }
+    }
+
     private final long handle;
+    private final Cleaner.Cleanable cleanable;
     private volatile boolean closed = false;
 
     public LlamaModel(String path) {
@@ -26,6 +52,7 @@ public final class LlamaModel implements AutoCloseable {
         if (this.handle == 0) {
             throw new IllegalStateException("Failed to load model: " + path);
         }
+        this.cleanable = NativeCleaner.INSTANCE.register(this, new State(this.handle));
     }
 
     public LlamaContext createContext(int nCtx, int nThreads) {
@@ -65,9 +92,9 @@ public final class LlamaModel implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed) {
-            closed = true;
-            LlamaNative.freeModel(handle);
-        }
+        closed = true;
+        // Idempotent: safe even if the Cleaner already ran, or close() is
+        // called more than once.
+        cleanable.clean();
     }
 }
