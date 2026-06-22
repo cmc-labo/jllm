@@ -12,7 +12,7 @@ Models are registered by pointing to a local GGUF file and a [llama.cpp](https:/
 
 ## Build
 
-**Without Maven** (recommended — downloads Gson automatically):
+**Without Maven** (recommended — downloads Gson, SLF4J, and Logback automatically):
 
 ```bash
 bash build.sh
@@ -152,6 +152,8 @@ local-llm-env/
 │   ├── CMakeLists.txt
 │   ├── build.sh
 │   └── llama_jni.cpp
+├── src/main/resources/
+│   └── logback.xml                       # Default Logback config (console, native logger at INFO)
 └── src/main/java/dev/localllm/
     ├── Main.java                         # CLI entry point
     ├── model/
@@ -164,6 +166,8 @@ local-llm-env/
     └── jni/
         ├── LlamaNative.java              # Raw native method declarations
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
+        ├── NativeLogBridge.java          # Forwards native log output into SLF4J
+        ├── NativeCrashException.java     # Thrown when a native fatal signal is caught
         ├── LlamaModel.java               # High-level model wrapper (AutoCloseable)
         ├── LlamaContext.java             # High-level inference context wrapper
         └── LlamaDemo.java                # Minimal smoke-test CLI
@@ -172,8 +176,9 @@ local-llm-env/
 ## Notes
 
 - The registry file lives at `~/.local-llm/models.json` and persists across sessions.
-- The API server uses the JDK's built-in `com.sun.net.httpserver.HttpServer` — no extra dependencies beyond Gson.
+- The API server uses the JDK's built-in `com.sun.net.httpserver.HttpServer` — no extra HTTP framework dependency.
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md), which is compatible with most modern GGUF models.
+- Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below).
 
 ## JNI Binding (`dev.localllm.jni`)
 
@@ -241,8 +246,30 @@ Verified end-to-end against [`ggml-org/models/tinyllamas/stories260K.gguf`](http
 
 | Class | Purpose |
 |---|---|
-| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API (model/context lifecycle, tokenize, detokenize, EOG check, streaming generate) |
+| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API (model/context lifecycle, tokenize, detokenize, EOG check, streaming generate, log callback registration) |
 | `LlamaModel` | `AutoCloseable` wrapper; loads a GGUF file, exposes tokenization helpers and `createContext()` |
 | `LlamaContext` | `AutoCloseable` wrapper bound to a model; exposes `generate()` and `generateStreaming()` |
+| `NativeLogBridge` | Forwards llama.cpp/ggml native log output into SLF4J (see [Native log output](#native-log-output)) |
+| `NativeCrashException` | Thrown when native code hits a fatal signal that was intercepted instead of killing the JVM (see [Crash containment](#crash-containment)) |
 
 Generation uses greedy sampling when `temperature <= 0`, otherwise temperature + distribution sampling (`llama_sampler_init_temp` + `llama_sampler_init_dist`).
+
+### Concurrency
+
+A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. `LlamaContext` guards every native call with a lock, so calls on a *shared* context are serialized rather than racing — but for actual parallel generation across users, create one `LlamaContext` per concurrent request via `LlamaModel.createContext()`. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design).
+
+### Crash containment
+
+Bad input or a native bug inside llama.cpp/ggml can otherwise either escape as a C++ exception across the JNI boundary (undefined behavior) or raise a fatal signal (`SIGSEGV`, `SIGABRT` from a failed `GGML_ASSERT`, `SIGBUS`, `SIGFPE`, `SIGILL`) that kills the JVM process outright. `native/llama_jni.cpp` guards against both: arguments are validated before touching native memory, C++ exceptions are caught and rethrown as Java exceptions, and a per-call signal handler converts a caught fatal signal into a `NativeCrashException` instead of taking down the process.
+
+This is best-effort containment, not full recovery: a signal caught mid-call may leave native heap state corrupted in ways invisible from Java, so once any call has crashed, every subsequent native call in the process refuses to run (throwing `NativeCrashException` immediately) — restart the process rather than continuing to use it. It also only covers the JNI-calling thread; a crash on one of ggml's internal worker threads (batched decode with `nThreads > 1`) is not caught.
+
+### Native log output
+
+llama.cpp/ggml log everything (model loading, hardware/backend detection, decode warnings, the tensor-loading progress dots) through `llama_log_set`/`ggml_log_set` rather than printing directly. `LlamaModel` registers `NativeLogBridge` before `LlamaNative.backendInit()`, which forwards every native log line into the SLF4J logger named `dev.localllm.native` (mapped to `debug`/`info`/`warn`/`error`; multi-part "continuation" output like the progress dots is coalesced into a single line first). Control verbosity the normal SLF4J/Logback way, e.g. in your own `logback.xml`:
+
+```xml
+<logger name="dev.localllm.native" level="WARN"/>
+```
+
+or override the bundled default entirely with `-Dlogback.configurationFile=/path/to/logback.xml`.
