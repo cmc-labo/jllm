@@ -1,0 +1,16 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- llama.cpp/ggml native log output, forwarded via NativeLogBridge.
+         Native DEBUG output (e.g. per-tensor load lines) is noisy; keep it
+         at INFO by default and let users raise it for native-side debugging. -->
+    <logger name="dev.localllm.native" level="INFO"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

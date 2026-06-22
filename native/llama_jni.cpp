@@ -73,11 +73,26 @@ std::string tokenToPieceStr(const llama_vocab* vocab, llama_token token) {
     return std::string(buf, n);
 }
 
-void quietLogCallback(ggml_log_level level, const char* text, void*) {
-    if (level >= GGML_LOG_LEVEL_ERROR) {
-        fputs(text, stderr);
-    }
-}
+// ---------------------------------------------------------------------
+// Log forwarding into Java (see setLogCallback / forwardLogCallback below,
+// defined after the JNI exception helpers since they reuse them).
+// ---------------------------------------------------------------------
+
+// The Java callback registered via setLogCallback(), or nullptr if none.
+// Set once at startup (see NativeLogBridge.installOnce() on the Java
+// side) before any concurrent model/context use begins; forwardLogCallback
+// only ever reads it. We still publish it through an atomic release/
+// acquire pair so a reader on another thread is guaranteed to see the
+// fully-initialized jmethodID written just before it (see setLogCallback).
+std::atomic<jobject> g_logCallbackRef{nullptr};
+jmethodID g_logMethodId = nullptr;
+
+// JNIEnv for the JNI call currently in flight on this thread, set by
+// GuardActiveScope. Native log messages are only ever observed to be
+// emitted synchronously within a guarded JNI call (model load, context
+// creation, decode), so this is sufficient to call back into Java
+// without the overhead/complexity of JavaVM::AttachCurrentThread.
+thread_local JNIEnv* g_currentEnv = nullptr;
 
 // ---------------------------------------------------------------------
 // Java exception helpers
@@ -285,10 +300,80 @@ void installCrashHandlersOnce() {
 // destructor runs on every ordinary return/throw via stack unwinding. On
 // the signal-recovery path (siglongjmp), destructors are skipped, so
 // LLAMA_JNI_GUARD_BEGIN's recovery branch resets the flag manually there.
+// Also stashes the current JNIEnv* (see g_currentEnv) for the duration of
+// the call, restoring whatever was there before on the way out (JNI calls
+// can re-enter, e.g. a Java callback that itself calls back into native).
 struct GuardActiveScope {
-    GuardActiveScope() { g_guardActive = 1; }
-    ~GuardActiveScope() { g_guardActive = 0; }
+    JNIEnv* prevEnv;
+    explicit GuardActiveScope(JNIEnv* env) : prevEnv(g_currentEnv) {
+        g_guardActive = 1;
+        g_currentEnv = env;
+    }
+    ~GuardActiveScope() {
+        g_guardActive = 0;
+        g_currentEnv = prevEnv;
+    }
 };
+
+// Buffers native log output per-thread and flushes it to Java one
+// complete line at a time. llama.cpp/ggml emit GGML_LOG_LEVEL_CONT for
+// "continuation" output (e.g. the "...." progress dots printed while
+// loading tensors) that has no level of its own and no line break until
+// the caller is done - forwarding each fragment as its own log call would
+// flood the Java-side logger with single-character lines, so we coalesce
+// on '\n' instead and tag the merged line with the level of the message
+// that started it.
+thread_local std::string g_logLineBuffer;
+thread_local ggml_log_level g_logLineLevel = GGML_LOG_LEVEL_INFO;
+
+void emitLogLine(const std::string& line, ggml_log_level level) {
+    if (line.empty()) {
+        return;
+    }
+
+    JNIEnv* env = g_currentEnv;
+    jobject cb = g_logCallbackRef.load(std::memory_order_acquire);
+    if (env == nullptr || cb == nullptr) {
+        // No Java bridge registered yet (or this log line was produced
+        // off a thread we don't track a JNIEnv for) - fall back to stderr
+        // for warnings/errors rather than losing them silently.
+        if (level >= GGML_LOG_LEVEL_WARN) {
+            fputs(line.c_str(), stderr);
+            fputc('\n', stderr);
+        }
+        return;
+    }
+
+    jstring jline = env->NewStringUTF(line.c_str());
+    if (jline == nullptr) {
+        env->ExceptionClear(); // OOM constructing the string - drop this line
+        return;
+    }
+    env->CallVoidMethod(cb, g_logMethodId, static_cast<jint>(level), jline);
+    if (env->ExceptionCheck()) {
+        // Don't let a misbehaving Java log listener corrupt native control
+        // flow; the exception would otherwise surface at an unrelated JNI
+        // call site.
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jline);
+}
+
+void forwardLogCallback(ggml_log_level level, const char* text, void*) {
+    if (text == nullptr) {
+        return;
+    }
+    if (level != GGML_LOG_LEVEL_CONT) {
+        g_logLineLevel = level;
+    }
+    g_logLineBuffer.append(text);
+
+    size_t newlinePos;
+    while ((newlinePos = g_logLineBuffer.find('\n')) != std::string::npos) {
+        emitLogLine(g_logLineBuffer.substr(0, newlinePos), g_logLineLevel);
+        g_logLineBuffer.erase(0, newlinePos + 1);
+    }
+}
 
 } // namespace
 
@@ -309,14 +394,14 @@ struct GuardActiveScope {
         throwNativeCrash((env), signalName(llamajni_sig_));                 \
         return sentinel;                                                      \
     }                                                                         \
-    GuardActiveScope llamajni_guard_scope_
+    GuardActiveScope llamajni_guard_scope_(env)
 
 JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_backendInit
   (JNIEnv* env, jclass) {
     LLAMA_JNI_GUARD_BEGIN(env, );
     try {
         installCrashHandlersOnce();
-        llama_log_set(quietLogCallback, nullptr);
+        llama_log_set(forwardLogCallback, nullptr);
         ggml_backend_load_all();
         llama_backend_init();
     } catch (const std::exception& e) {
@@ -336,6 +421,44 @@ JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_backendFree
     } catch (...) {
         throwIllegalState(env, "backendFree failed: unknown native exception");
     }
+}
+
+// Registers (or, with callback == null, clears) the Java listener that
+// forwardLogCallback forwards llama.cpp/ggml log output to. Call this
+// before backendInit() so hardware-detection / model-load logging is
+// captured from the very first message instead of falling back to stderr.
+JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_setLogCallback
+  (JNIEnv* env, jclass, jobject callback) {
+    LLAMA_JNI_GUARD_BEGIN(env, );
+
+    jobject oldRef = g_logCallbackRef.exchange(nullptr, std::memory_order_acq_rel);
+    if (oldRef != nullptr) {
+        env->DeleteGlobalRef(oldRef);
+    }
+    g_logMethodId = nullptr;
+
+    if (callback == nullptr) {
+        return;
+    }
+
+    jclass cbClass = env->GetObjectClass(callback);
+    jmethodID mid = env->GetMethodID(cbClass, "onLog", "(ILjava/lang/String;)V");
+    env->DeleteLocalRef(cbClass);
+    if (mid == nullptr) {
+        // GetMethodID already left a pending exception (NoSuchMethodError).
+        return;
+    }
+
+    jobject newRef = env->NewGlobalRef(callback);
+    if (newRef == nullptr) {
+        throwOutOfMemory(env, "failed to create global ref for log callback");
+        return;
+    }
+
+    // Publish the jmethodID before the ref so an acquire-load of
+    // g_logCallbackRef on another thread is guaranteed to see it too.
+    g_logMethodId = mid;
+    g_logCallbackRef.store(newRef, std::memory_order_release);
 }
 
 JNIEXPORT jlong JNICALL Java_dev_localllm_jni_LlamaNative_loadModel

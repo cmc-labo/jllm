@@ -16,6 +16,27 @@ public final class LlamaNative {
     public static native void backendInit();
     public static native void backendFree();
 
+    /**
+     * Registers the listener that llama.cpp/ggml native log output
+     * (model loading, hardware/backend detection, decode warnings, ...)
+     * is forwarded to, replacing any previously registered listener.
+     * Pass {@code null} to stop forwarding. Must be called before
+     * {@link #backendInit()} to also capture logging that happens during
+     * backend initialization itself.
+     */
+    public static native void setLogCallback(LogCallback callback);
+
+    /** ggml_log_level values forwarded to {@link LogCallback#onLog}. */
+    public static final int LOG_LEVEL_DEBUG = 1;
+    public static final int LOG_LEVEL_INFO  = 2;
+    public static final int LOG_LEVEL_WARN  = 3;
+    public static final int LOG_LEVEL_ERROR = 4;
+
+    /** Invoked from native code for each complete native log line. */
+    public interface LogCallback {
+        void onLog(int level, String message);
+    }
+
     /** Returns a model handle, or 0 on failure. */
     public static native long loadModel(String path, int nGpuLayers);
     public static native void freeModel(long model);

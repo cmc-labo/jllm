@@ -46,6 +46,9 @@ public final class LlamaModel implements AutoCloseable {
     /** @param nGpuLayers number of layers to offload to GPU; 0 = CPU only, negative = all layers. */
     public LlamaModel(String path, int nGpuLayers) {
         if (BACKEND_INITIALIZED.compareAndSet(false, true)) {
+            // Install the log bridge before backendInit() so logging from
+            // backend/hardware detection itself is captured too.
+            NativeLogBridge.installOnce();
             LlamaNative.backendInit();
         }
         this.handle = LlamaNative.loadModel(path, nGpuLayers);

@@ -1,32 +1,62 @@
 #!/bin/bash
-# Maven不要のビルドスクリプト。Gsonを自動ダウンロードしてfat JARを生成する。
+# Maven不要のビルドスクリプト。依存JARを自動ダウンロードしてfat JARを生成する。
 set -e
 
 GSON_VERSION="2.10.1"
 GSON_JAR="lib/gson-${GSON_VERSION}.jar"
 GSON_URL="https://repo1.maven.org/maven2/com/google/code/gson/gson/${GSON_VERSION}/gson-${GSON_VERSION}.jar"
+
+SLF4J_VERSION="2.0.13"
+SLF4J_JAR="lib/slf4j-api-${SLF4J_VERSION}.jar"
+SLF4J_URL="https://repo1.maven.org/maven2/org/slf4j/slf4j-api/${SLF4J_VERSION}/slf4j-api-${SLF4J_VERSION}.jar"
+
+LOGBACK_VERSION="1.5.6"
+LOGBACK_CLASSIC_JAR="lib/logback-classic-${LOGBACK_VERSION}.jar"
+LOGBACK_CLASSIC_URL="https://repo1.maven.org/maven2/ch/qos/logback/logback-classic/${LOGBACK_VERSION}/logback-classic-${LOGBACK_VERSION}.jar"
+LOGBACK_CORE_JAR="lib/logback-core-${LOGBACK_VERSION}.jar"
+LOGBACK_CORE_URL="https://repo1.maven.org/maven2/ch/qos/logback/logback-core/${LOGBACK_VERSION}/logback-core-${LOGBACK_VERSION}.jar"
+
 OUT_JAR="target/local-llm.jar"
 
 echo "=== local-llm build ==="
 
 mkdir -p lib target/classes target/fat
 
-if [ ! -f "$GSON_JAR" ]; then
-    echo "Downloading Gson ${GSON_VERSION}..."
-    curl -fsSL -o "$GSON_JAR" "$GSON_URL"
-    echo "Done."
-fi
+download_if_missing() {
+    local dest="$1" url="$2"
+    if [ ! -f "$dest" ]; then
+        echo "Downloading $(basename "$dest")..."
+        curl -fsSL -o "$dest" "$url"
+    fi
+}
+
+download_if_missing "$GSON_JAR" "$GSON_URL"
+download_if_missing "$SLF4J_JAR" "$SLF4J_URL"
+download_if_missing "$LOGBACK_CLASSIC_JAR" "$LOGBACK_CLASSIC_URL"
+download_if_missing "$LOGBACK_CORE_JAR" "$LOGBACK_CORE_URL"
+
+CP="$GSON_JAR:$SLF4J_JAR:$LOGBACK_CLASSIC_JAR:$LOGBACK_CORE_JAR"
 
 echo "Compiling..."
 find src/main/java -name "*.java" | sort > /tmp/local_llm_sources.txt
-javac -source 11 -target 11 -cp "$GSON_JAR" -d target/classes @/tmp/local_llm_sources.txt
+javac -source 11 -target 11 -cp "$CP" -d target/classes @/tmp/local_llm_sources.txt
 rm /tmp/local_llm_sources.txt
+
+if [ -d src/main/resources ]; then
+    cp -r src/main/resources/* target/classes/
+fi
 
 echo "Packaging fat JAR..."
 cp -r target/classes/* target/fat/
 cd target/fat
 jar xf "../../$GSON_JAR"
-rm -rf META-INF
+jar xf "../../$SLF4J_JAR"
+jar xf "../../$LOGBACK_CORE_JAR"
+jar xf "../../$LOGBACK_CLASSIC_JAR"
+# Keep META-INF/services (SLF4J binding discovery relies on it) but drop
+# the rest (per-jar manifests, module info, license files, ...) so they
+# don't collide when multiple dependency JARs are merged into one.
+find META-INF -mindepth 1 -maxdepth 1 ! -name services -exec rm -rf {} +
 cd ../..
 
 jar cfe "$OUT_JAR" dev.localllm.Main -C target/fat .
