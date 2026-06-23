@@ -2,13 +2,16 @@
 
 A lightweight Java tool for managing and running local LLMs — similar to Ollama but minimal by design.
 
-Models are registered by pointing to a local GGUF file and a [llama.cpp](https://github.com/ggerganov/llama.cpp) binary. The registry is stored in `~/.local-llm/models.json`.
+Models are registered by pointing to a local GGUF file and (optionally) a [llama.cpp](https://github.com/ggerganov/llama.cpp) binary. The registry is stored in `~/.local-llm/models.json`.
+
+`run` (interactive chat) shells out to a `llama-cli` binary. `serve` (the HTTP API server) instead runs inference in-process via a JNI binding to llama.cpp - see [JNI Binding](#jni-binding-devlocalllmjni) - so it needs `native/build/libllamajni.so` built rather than a `llama-cli` binary.
 
 ## Requirements
 
 - Java 11+
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-cli` binary) for running models
 - A GGUF model file
+- For `run`: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-cli` binary)
+- For `serve`: a built `libllamajni.so` (see [Build steps](#build-steps) under JNI Binding)
 
 ## Build
 
@@ -80,7 +83,13 @@ $JAR rm phi3:mini
 
 ## HTTP API
 
-The server exposes an Ollama-compatible REST API.
+The server exposes an Ollama-compatible REST API. `/api/generate` and `/api/chat` stream by
+default: the response is newline-delimited JSON (`application/x-ndjson`), one object per
+generated token, flushed as soon as the JNI layer produces it - not buffered until generation
+finishes. Pass `"stream": false` to instead get a single JSON object once generation completes.
+
+The model named in `model` is loaded into memory on first use and kept resident for subsequent
+requests (no reload-per-request); each request gets its own short-lived inference context.
 
 ### `GET /api/tags` — List models
 
@@ -108,9 +117,20 @@ curl http://localhost:11434/api/generate \
   -d '{
     "model": "phi3:mini",
     "prompt": "Why is the sky blue?",
-    "options": { "num_predict": 200 }
+    "options": { "num_predict": 200, "temperature": 0.8 }
   }'
 ```
+
+Streaming response (default), one JSON object per line:
+
+```json
+{"model":"phi3:mini","created_at":"2026-06-16T00:00:00Z","response":"The","done":false}
+{"model":"phi3:mini","created_at":"2026-06-16T00:00:00Z","response":" sky","done":false}
+...
+{"model":"phi3:mini","created_at":"2026-06-16T00:00:00Z","response":"","done":true}
+```
+
+With `"stream": false`:
 
 ```json
 {
@@ -132,6 +152,17 @@ curl http://localhost:11434/api/chat \
     ]
   }'
 ```
+
+Streaming response (default), one JSON object per line:
+
+```json
+{"model":"phi3:mini","created_at":"2026-06-16T00:00:00Z","message":{"role":"assistant","content":"Hello"},"done":false}
+{"model":"phi3:mini","created_at":"2026-06-16T00:00:00Z","message":{"role":"assistant","content":"!"},"done":false}
+...
+{"model":"phi3:mini","created_at":"2026-06-16T00:00:00Z","message":{"role":"assistant","content":""},"done":true}
+```
+
+With `"stream": false`:
 
 ```json
 {
@@ -160,9 +191,9 @@ local-llm-env/
     │   ├── ModelConfig.java              # Model POJO
     │   └── ModelRegistry.java            # Persists registry to ~/.local-llm/models.json
     ├── runner/
-    │   └── ModelRunner.java              # Runs llama.cpp as a subprocess
+    │   └── ModelRunner.java              # Runs llama.cpp as a subprocess (used by `run`)
     ├── server/
-    │   └── ApiServer.java                # Ollama-compatible HTTP API server
+    │   └── ApiServer.java                # Ollama-compatible HTTP API server (JNI, in-process, streaming)
     └── jni/
         ├── LlamaNative.java              # Raw native method declarations
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
@@ -226,8 +257,16 @@ try (LlamaModel model = new LlamaModel("/path/to/model.gguf", /* nGpuLayers */ 0
     // One-shot:
     String text = ctx.generate("Once upon a time", /* nPredict */ 128, /* temperature */ 0.8f);
 
-    // Streaming:
+    // Streaming via push callback:
     ctx.generateStreaming("Once upon a time", 128, 0.8f, piece -> System.out.print(piece));
+
+    // Streaming via pull-based Iterator/Iterable - e.g. to write each token
+    // straight to an HTTP response as it's produced (see ApiServer):
+    try (LlamaContext.TokenStream tokens = ctx.generateTokens("Once upon a time", 128, 0.8f)) {
+        for (String piece : tokens) {
+            System.out.print(piece);
+        }
+    }
 }
 ```
 
@@ -248,15 +287,31 @@ Verified end-to-end against [`ggml-org/models/tinyllamas/stories260K.gguf`](http
 |---|---|
 | `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API (model/context lifecycle, tokenize, detokenize, EOG check, streaming generate, log callback registration) |
 | `LlamaModel` | `AutoCloseable` wrapper; loads a GGUF file, exposes tokenization helpers and `createContext()` |
-| `LlamaContext` | `AutoCloseable` wrapper bound to a model; exposes `generate()` and `generateStreaming()` |
+| `LlamaContext` | `AutoCloseable` wrapper bound to a model; exposes `generate()`, `generateStreaming()` (push callback), and `generateTokens()` (pull-based `TokenStream`) |
+| `LlamaContext.TokenStream` | `Iterator<String>` + `Iterable<String>` + `AutoCloseable` view over one `generateTokens()` call; runs generation on a background thread and hands off tokens one at a time, so a caller can pull (and stop pulling) at its own pace |
 | `NativeLogBridge` | Forwards llama.cpp/ggml native log output into SLF4J (see [Native log output](#native-log-output)) |
 | `NativeCrashException` | Thrown when native code hits a fatal signal that was intercepted instead of killing the JVM (see [Crash containment](#crash-containment)) |
 
 Generation uses greedy sampling when `temperature <= 0`, otherwise temperature + distribution sampling (`llama_sampler_init_temp` + `llama_sampler_init_dist`).
 
+### Token streaming
+
+`generateStreaming()`'s native callback runs synchronously on the calling thread - convenient for
+a push-style consumer, but not directly usable as a pull-based `Iterator`/`Stream`/source for a
+blocking-I/O server loop. `generateTokens()` bridges the two: it starts the (blocking) native
+generation call on a dedicated background thread and hands each token to the caller through a
+`SynchronousQueue`, exposed as `TokenStream`. This was chosen over `java.util.concurrent.Flow`
+(Reactive Streams) because `ApiServer` is built on the JDK's thread-per-request, blocking
+`HttpServer` - there's no async I/O underneath for Reactive Streams' backpressure machinery to
+plug into, so a plain blocking `Iterator` matches the actual execution model with far less code.
+
+Always close a `TokenStream` (try-with-resources, as above) even if you stop iterating before it's
+exhausted: `close()` interrupts the background thread and drains the queue until it exits, so an
+early `break` (e.g. a client disconnecting mid-response in `ApiServer`) can't leak it.
+
 ### Concurrency
 
-A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. `LlamaContext` guards every native call with a lock, so calls on a *shared* context are serialized rather than racing — but for actual parallel generation across users, create one `LlamaContext` per concurrent request via `LlamaModel.createContext()`. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design).
+A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. `LlamaContext` guards every native call with a lock, so calls on a *shared* context are serialized rather than racing — but for actual parallel generation across users, create one `LlamaContext` per concurrent request via `LlamaModel.createContext()`. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design). `ApiServer` follows exactly this pattern: one shared `LlamaModel` per registered model, loaded lazily on first request, and a fresh `LlamaContext` (closed when the request ends) per request - so concurrent requests against the same model run truly in parallel rather than queuing behind the lock. A context pool (to avoid paying KV-cache allocation cost on every request) would be a reasonable next optimization but isn't implemented yet.
 
 ### Crash containment
 

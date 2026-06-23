@@ -1,6 +1,12 @@
 package dev.localllm.jni;
 
 import java.lang.ref.Cleaner;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
@@ -85,6 +91,163 @@ public final class LlamaContext implements AutoCloseable {
             });
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * Generates up to {@code nPredict} tokens, exposing them as a pull-based
+     * {@link Iterator}/{@link Iterable} instead of a push callback - the
+     * natural fit for a thread-per-request blocking server, where each
+     * token can be written out as soon as it's pulled rather than buffered
+     * until generation finishes.
+     *
+     * <p>Generation runs on a dedicated background thread that blocks on
+     * the native call between tokens, handing each one to the returned
+     * {@link TokenStream}. Always {@link TokenStream#close()} it (use
+     * try-with-resources) - an abandoned, not-fully-iterated stream would
+     * otherwise leak that background thread.
+     */
+    public TokenStream generateTokens(String prompt, int nPredict, float temperature) {
+        checkOpen();
+        return new TokenStream(this, prompt, nPredict, temperature);
+    }
+
+    /**
+     * A single-traversal, pull-based view over the tokens of one
+     * {@link #generateTokens} call. Not safe for concurrent use from
+     * multiple threads (same as any other {@link Iterator}), but
+     * {@link #close()} may be called at any time, from generation start to
+     * after exhaustion, to stop generation early and release the
+     * background thread.
+     */
+    public static final class TokenStream implements Iterator<String>, Iterable<String>, AutoCloseable {
+
+        // Sentinel published on the queue once generation has ended (either
+        // exhausted nPredict, hit EOG, or was cancelled / errored).
+        private static final Object DONE = new Object();
+
+        private final SynchronousQueue<Object> queue = new SynchronousQueue<>();
+        private final Thread producer;
+        private final AtomicReference<Throwable> error = new AtomicReference<>();
+
+        private boolean lookaheadFetched = false;
+        private Object lookahead;
+        private boolean closed = false;
+
+        TokenStream(LlamaContext ctx, String prompt, int nPredict, float temperature) {
+            producer = new Thread(() -> {
+                try {
+                    ctx.generateStreaming(prompt, nPredict, temperature, piece -> {
+                        try {
+                            queue.put(piece);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            // Propagates out of generateStreaming() via the JNI
+                            // layer's "callback threw -> stop decoding" check.
+                            throw new CancellationException("token stream closed");
+                        }
+                    });
+                } catch (CancellationException expected) {
+                    // close() interrupted us to stop generation early.
+                } catch (Throwable t) {
+                    error.set(t);
+                } finally {
+                    putUninterruptibly(DONE);
+                }
+            }, "llama-token-stream");
+            producer.setDaemon(true);
+            producer.start();
+        }
+
+        // Used only for the final DONE handoff: close()'s drain loop always
+        // keeps a consumer available until this thread exits, so this never
+        // blocks forever in practice - but put() is itself interruptible,
+        // so a stray interrupt here must not be allowed to skip the handoff.
+        private void putUninterruptibly(Object value) {
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        queue.put(value);
+                        return;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            fetchLookahead();
+            return lookahead != DONE;
+        }
+
+        @Override
+        public String next() {
+            fetchLookahead();
+            if (lookahead == DONE) {
+                throw new NoSuchElementException();
+            }
+            String value = (String) lookahead;
+            lookahead = null;
+            lookaheadFetched = false;
+            return value;
+        }
+
+        private void fetchLookahead() {
+            if (lookaheadFetched) {
+                return;
+            }
+            try {
+                lookahead = queue.take();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                close();
+                lookahead = DONE;
+            }
+            lookaheadFetched = true;
+            if (lookahead == DONE) {
+                Throwable t = error.get();
+                if (t instanceof RuntimeException) {
+                    throw (RuntimeException) t;
+                } else if (t instanceof Error) {
+                    throw (Error) t;
+                } else if (t != null) {
+                    throw new RuntimeException("token generation failed", t);
+                }
+            }
+        }
+
+        @Override
+        public Iterator<String> iterator() {
+            return this;
+        }
+
+        /** Stops generation (if still running) and releases the background thread. Idempotent. */
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            producer.interrupt();
+            // Keep draining so a put() the producer is blocked on (or about
+            // to make) always has a consumer, even though nothing else is
+            // reading anymore - otherwise it could block forever past the
+            // point where interrupting it was supposed to free it.
+            while (producer.isAlive()) {
+                try {
+                    queue.poll(50, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
     }
 
