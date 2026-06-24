@@ -183,6 +183,11 @@ local-llm-env/
 │   ├── CMakeLists.txt
 │   ├── build.sh
 │   └── llama_jni.cpp
+├── native/dist/                               # Pre-built native libs for JAR bundling
+│   ├── linux-x86_64/libllamajni.so          #   (produced by native/build.sh --static)
+│   ├── linux-x86_64-cuda/libllamajni.so
+│   ├── osx-aarch64/libllamajni.dylib
+│   └── windows-x86_64/llamajni.dll
 ├── src/main/resources/
 │   └── logback.xml                       # Default Logback config (console, native logger at INFO)
 └── src/main/java/dev/localllm/
@@ -221,29 +226,83 @@ llama.cpp is a C/C++ library; running models fast on CPU/GPU requires linking ag
 
 ### Build steps
 
-**1. Build llama.cpp as a shared library** (one-time; not vendored in this repo, see `.gitignore`):
+There are two build modes:
+
+**Dev build** (fast, for local development):
 
 ```bash
+# 1. Build llama.cpp as shared libs (once per checkout)
 git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)" --target llama ggml
-cd ..
-```
+cd llama.cpp && cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j && cd ..
 
-**2. Generate the JNI header and compile the Java classes:**
-
-```bash
+# 2. Generate the JNI header
 javac -h jni-headers -d target/classes src/main/java/dev/localllm/jni/*.java
+
+# 3. Build the JNI wrapper (links dynamically against step 1's libllama.so)
+bash native/build.sh
+# → native/build/libllamajni.so  (uses rpath; libllama.so must stay nearby)
 ```
 
-**3. Build the JNI shared library** (links against `llama.cpp/build/bin/libllama.so`):
+**Distribution / JAR-bundling build** (self-contained, for shipping):
+
+Each platform variant is built separately and dropped into `native/dist/` where
+`build.sh` picks them up automatically:
 
 ```bash
-bash native/build.sh
+# Same prerequisite: llama.cpp source checkout at ./llama.cpp
+
+# Generate JNI header (same as above)
+javac -h jni-headers -d target/classes src/main/java/dev/localllm/jni/*.java
+
+# CPU-only build for the current platform
+bash native/build.sh --static
+# → native/dist/linux-x86_64/libllamajni.so  (no external deps)
+
+# CUDA build (needs CUDA toolkit, NVIDIA GPU)
+bash native/build.sh --static --variant cuda
+# → native/dist/linux-x86_64-cuda/libllamajni.so
+
+# ROCm build (needs ROCm stack, AMD GPU)
+bash native/build.sh --static --variant rocm
+# → native/dist/linux-x86_64-rocm/libllamajni.so
+
+# Package everything into the fat JAR (bundles all dist/ variants found)
+bash build.sh
+# → target/local-llm.jar  (contains native/linux-x86_64/... etc. as resources)
 ```
 
-This produces `native/build/libllamajni.so`, linked with an rpath back to `llama.cpp/build/bin` so `libllama.so` / `libggml*.so` resolve automatically at runtime.
+Run `bash native/build.sh --help` for the full option list.
+
+### Native library loading and platform support
+
+`NativeLibraryLoader` resolves the right `.so` / `.dylib` / `.dll` automatically at
+runtime, in this priority order:
+
+| Priority | Mechanism | When to use |
+|---|---|---|
+| 1 | `-Ddev.localllm.nativeLib=<absolute-path>` | Point to any single file |
+| 2 | `-Ddev.localllm.nativeLibDir=<dir>` | Directory of pre-built libs |
+| 3 | `./native/build/<filename>` (relative to CWD) | After a dev `native/build.sh` run |
+| 4 | Extracted from inside the JAR | Fat-JAR distribution (no extra setup) |
+
+For JAR-based loading (priority 4), the library is extracted to
+`${java.io.tmpdir}/local-llm-native/<version>/<classifier>/` on first run and
+reused on subsequent runs.
+
+**Classifier naming:** `{os}-{arch}[-{gpu}]`
+
+| os | arch | gpu variants |
+|---|---|---|
+| `linux` | `x86_64`, `aarch64` | `-cuda`, `-rocm` |
+| `osx` | `x86_64`, `aarch64` | `-metal` (arm64 only; otherwise implicit) |
+| `windows` | `x86_64` | `-cuda` |
+
+**GPU auto-detection:** on Linux, CUDA presence is checked via
+`/proc/driver/nvidia/version` (created by the NVIDIA kernel module); ROCm via
+`/dev/kfd`. On Windows, `%SystemRoot%\System32\nvcuda.dll`. GPU-accelerated
+variants are tried first; the CPU-only classifier is the final fallback. If a
+detected GPU variant is not bundled in the JAR the next candidate is tried
+automatically, so shipping CPU-only is always sufficient.
 
 ### Usage from Java
 

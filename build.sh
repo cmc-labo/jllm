@@ -46,6 +46,20 @@ if [ -d src/main/resources ]; then
     cp -r src/main/resources/* target/classes/
 fi
 
+# Bundle any pre-built native libraries for JAR-based auto-loading.
+# Build them first with: bash native/build.sh --static [--variant cuda|rocm|metal]
+# Each variant goes into native/dist/<classifier>/ and is bundled at
+# native/<classifier>/<filename> inside the JAR so NativeLibraryLoader can
+# extract and load the right one at runtime.
+if [ -d native/dist ] && [ -n "$(ls -A native/dist 2>/dev/null)" ]; then
+    echo "Bundling native libraries from native/dist/..."
+    mkdir -p target/classes/native
+    cp -r native/dist/* target/classes/native/
+    for classifier in native/dist/*/; do
+        echo "  + $(basename "$classifier")"
+    done
+fi
+
 echo "Packaging fat JAR..."
 cp -r target/classes/* target/fat/
 cd target/fat
