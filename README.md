@@ -40,10 +40,12 @@ java -jar target/local-llm.jar <command> [options]
 | Command | Description |
 |---|---|
 | `list` | List registered models |
-| `add <name> --path <path>` | Register a model |
+| `add <name> --path <path>` | Register a model by pointing to a GGUF file directly |
+| `create <name> -f <Modelfile>` | Create a model from a Modelfile (system prompt, parameters, …) |
 | `rm <name>` | Remove a model |
 | `run <name>` | Start an interactive chat session |
 | `serve [--port <port>]` | Start the HTTP API server (default: 11434) |
+| `show <name>` | Print the model's Modelfile and parameter summary |
 | `info <name>` | Show model details |
 
 ### Options for `add`
@@ -54,21 +56,76 @@ java -jar target/local-llm.jar <command> [options]
 | `--binary <path>` | Path to `llama-cli`. Auto-detected if omitted |
 | `--format <fmt>` | Model format (default: `gguf`) |
 
+### Modelfile
+
+`create` reads a **Modelfile** — a plain-text file similar to Ollama's — and stores
+its settings in the registry. Every field is optional except `FROM`.
+
+```
+# My assistant
+FROM /path/to/model.gguf
+
+PARAMETER temperature   0.7
+PARAMETER num_predict   1024
+PARAMETER num_ctx       4096
+PARAMETER num_threads   4
+
+SYSTEM You are a helpful, concise assistant.
+```
+
+Multi-line system prompts use triple-quote blocks:
+
+```
+SYSTEM """
+You are a helpful assistant.
+Always respond in the language the user writes in.
+"""
+```
+
+Supported `PARAMETER` keys: `temperature`, `num_predict`, `num_ctx`, `num_threads`.
+Unknown instructions (e.g. `TEMPLATE`, `ADAPTER`) are silently ignored, so Modelfiles
+written for full Ollama can be reused here without parse errors.
+
+Parameter precedence at inference time:
+1. `options.*` in the API request body (highest — caller always wins)
+2. `PARAMETER` values from the model's Modelfile
+3. Server-wide defaults (`temperature 0.8`, `num_predict 200`, `num_ctx 4096`)
+
+### Options for `create`
+
+| Flag | Description |
+|---|---|
+| `-f <path>`, `--file <path>` | **(required)** Path to the Modelfile |
+| `--binary <path>` | Path to `llama-cli` for the `run` command |
+
 ## Examples
 
 ```bash
 JAR="java -jar target/local-llm.jar"
 
-# Register a model
+# Register a model by path (no Modelfile)
 $JAR add phi3:mini --path ~/models/phi3-mini-4k-instruct-q4.gguf --binary /usr/local/bin/llama-cli
+
+# --- or --- create from a Modelfile (recommended for repeatable config)
+cat > Modelfile << 'EOF'
+FROM ~/models/phi3-mini-4k-instruct-q4.gguf
+PARAMETER temperature 0.7
+PARAMETER num_predict 1024
+PARAMETER num_ctx 4096
+SYSTEM You are a helpful, concise assistant.
+EOF
+$JAR create phi3:mini -f Modelfile --binary /usr/local/bin/llama-cli
+
+# Show Modelfile representation of a registered model
+$JAR show phi3:mini
 
 # List registered models
 $JAR list
 
-# Show model details
+# Show raw model details
 $JAR info phi3:mini
 
-# Interactive chat
+# Interactive chat (uses Modelfile parameters if set)
 $JAR run phi3:mini
 
 # Start API server on default port 11434
@@ -90,6 +147,22 @@ finishes. Pass `"stream": false` to instead get a single JSON object once genera
 
 The model named in `model` is loaded into memory on first use and kept resident for subsequent
 requests (no reload-per-request); each request gets its own short-lived inference context.
+
+### `POST /api/show` — Model details
+
+Returns the model's reconstructed Modelfile, parameter summary, and format details.
+
+```bash
+curl http://localhost:11434/api/show -d '{"name": "phi3:mini"}'
+```
+
+```json
+{
+  "modelfile": "FROM ~/models/phi3-mini.gguf\nPARAMETER temperature 0.7\nSYSTEM You are a helpful assistant.\n",
+  "parameters": "temperature 0.7\nnum_predict 1024",
+  "details": { "format": "gguf" }
+}
+```
 
 ### `GET /api/tags` — List models
 
@@ -193,7 +266,8 @@ local-llm-env/
 └── src/main/java/dev/localllm/
     ├── Main.java                         # CLI entry point
     ├── model/
-    │   ├── ModelConfig.java              # Model POJO
+    │   ├── ModelConfig.java              # Model POJO (path, parameters, system prompt, …)
+    │   ├── Modelfile.java                # Modelfile parser and serializer
     │   └── ModelRegistry.java            # Persists registry to ~/.local-llm/models.json
     ├── runner/
     │   └── ModelRunner.java              # Runs llama.cpp as a subprocess (used by `run`)
@@ -211,9 +285,9 @@ local-llm-env/
 
 ## Notes
 
-- The registry file lives at `~/.local-llm/models.json` and persists across sessions.
+- The registry file lives at `~/.local-llm/models.json` and persists across sessions. All Modelfile parameters (`temperature`, `num_predict`, `num_ctx`, `num_threads`, system prompt) are stored here as part of each model's entry.
 - The API server uses the JDK's built-in `com.sun.net.httpserver.HttpServer` — no extra HTTP framework dependency.
-- Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md), which is compatible with most modern GGUF models.
+- Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md). A model's Modelfile `SYSTEM` prompt is injected as a `system` turn at the start of every chat — unless the request already includes a `system` role message, in which case the request takes precedence.
 - Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below).
 
 ## JNI Binding (`dev.localllm.jni`)
