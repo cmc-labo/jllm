@@ -9,6 +9,7 @@ import com.sun.net.httpserver.HttpServer;
 import dev.localllm.jni.LlamaContext;
 import dev.localllm.jni.LlamaModel;
 import dev.localllm.model.ModelConfig;
+import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
 
 import java.io.IOException;
@@ -43,8 +44,7 @@ public class ApiServer {
 
     private static final Logger LOG = LoggerFactory.getLogger(ApiServer.class);
 
-    // Not yet exposed via ModelConfig / `add` - same defaults for every
-    // model until per-model tuning is needed.
+    // Server-wide defaults; overridden per-model by Modelfile PARAMETER values.
     private static final int DEFAULT_N_CTX = 4096;
     private static final int DEFAULT_N_THREADS = Math.max(1, Runtime.getRuntime().availableProcessors());
     private static final float DEFAULT_TEMPERATURE = 0.8f;
@@ -66,6 +66,7 @@ public class ApiServer {
     public void start() throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/api/tags", this::handleTags);
+        server.createContext("/api/show", this::handleShow);
         server.createContext("/api/generate", this::handleGenerate);
         server.createContext("/api/chat", this::handleChat);
         server.createContext("/", this::handleRoot);
@@ -75,6 +76,7 @@ public class ApiServer {
         System.out.printf("Listening on http://localhost:%d%n", port);
         System.out.println();
         System.out.printf("  GET  http://localhost:%d/api/tags%n", port);
+        System.out.printf("  POST http://localhost:%d/api/show%n", port);
         System.out.printf("  POST http://localhost:%d/api/generate%n", port);
         System.out.printf("  POST http://localhost:%d/api/chat%n", port);
         System.out.println();
@@ -88,6 +90,37 @@ public class ApiServer {
         body.put("name", "local-llm");
         body.put("version", "1.0.0");
         sendJson(ex, 200, body);
+    }
+
+    private void handleShow(HttpExchange ex) throws IOException {
+        if (!"POST".equals(ex.getRequestMethod())) {
+            sendError(ex, 405, "Method Not Allowed");
+            return;
+        }
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        JsonObject req = gson.fromJson(body, JsonObject.class);
+        String modelName = req.get("name").getAsString();
+
+        ModelConfig m = registry.get(modelName).orElse(null);
+        if (m == null) {
+            sendError(ex, 404, "model not found: " + modelName);
+            return;
+        }
+
+        StringBuilder parameters = new StringBuilder();
+        if (m.getTemperature() != null) parameters.append("temperature ").append(m.getTemperature()).append('\n');
+        if (m.getNumPredict()  != null) parameters.append("num_predict ").append(m.getNumPredict()).append('\n');
+        if (m.getNumCtx()      != null) parameters.append("num_ctx ").append(m.getNumCtx()).append('\n');
+        if (m.getNumThreads()  != null) parameters.append("num_threads ").append(m.getNumThreads()).append('\n');
+
+        Map<String, String> details = new HashMap<>();
+        details.put("format", m.getFormat() != null ? m.getFormat() : "gguf");
+
+        Map<String, Object> resp = new HashMap<>();
+        resp.put("modelfile", Modelfile.toText(m));
+        resp.put("parameters", parameters.toString().stripTrailing());
+        resp.put("details", details);
+        sendJson(ex, 200, resp);
     }
 
     private void handleTags(HttpExchange ex) throws IOException {
@@ -142,8 +175,14 @@ public class ApiServer {
             return;
         }
 
-        try (LlamaContext ctx = model.createContext(DEFAULT_N_CTX, DEFAULT_N_THREADS);
-             LlamaContext.TokenStream tokens = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
+        // Modelfile parameters override server-wide defaults; request options override both.
+        opts.applyModelDefaults(modelConfig);
+        int nCtx     = modelConfig.getNumCtx()     != null ? modelConfig.getNumCtx()     : DEFAULT_N_CTX;
+        int nThreads = modelConfig.getNumThreads()  != null ? modelConfig.getNumThreads() : DEFAULT_N_THREADS;
+        String effectivePrompt = withSystemPrompt(modelConfig.getSystemPrompt(), prompt);
+
+        try (LlamaContext ctx = model.createContext(nCtx, nThreads);
+             LlamaContext.TokenStream tokens = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
 
             if (opts.stream) {
                 ex.getResponseHeaders().set("Content-Type", "application/x-ndjson");
@@ -183,20 +222,35 @@ public class ApiServer {
             opts.numPredict = 500; // chat replies default to a longer budget than raw /api/generate
         }
 
-        // ChatML形式でプロンプトを組み立てる
+        ModelConfig modelConfig = registry.get(modelName).orElse(null);
+        if (modelConfig == null) {
+            sendError(ex, 404, "model not found: " + modelName);
+            return;
+        }
+
+        // ChatML形式でプロンプトを組み立てる。
+        // リクエストにsystemロールのメッセージがなく、Modelfileにsystem promptが設定されている場合は先頭に挿入する。
+        boolean hasSystemMessage = false;
+        for (int i = 0; i < messages.size(); i++) {
+            if ("system".equals(messages.get(i).getAsJsonObject().get("role").getAsString())) {
+                hasSystemMessage = true;
+                break;
+            }
+        }
+
         StringBuilder prompt = new StringBuilder();
+        if (!hasSystemMessage && modelConfig.getSystemPrompt() != null
+                && !modelConfig.getSystemPrompt().isEmpty()) {
+            prompt.append("<|im_start|>system\n")
+                  .append(modelConfig.getSystemPrompt())
+                  .append("<|im_end|>\n");
+        }
         for (int i = 0; i < messages.size(); i++) {
             JsonObject msg = messages.get(i).getAsJsonObject();
             prompt.append("<|im_start|>").append(msg.get("role").getAsString()).append("\n")
                   .append(msg.get("content").getAsString()).append("<|im_end|>\n");
         }
         prompt.append("<|im_start|>assistant\n");
-
-        ModelConfig modelConfig = registry.get(modelName).orElse(null);
-        if (modelConfig == null) {
-            sendError(ex, 404, "model not found: " + modelName);
-            return;
-        }
 
         LlamaModel model;
         try {
@@ -207,7 +261,11 @@ public class ApiServer {
             return;
         }
 
-        try (LlamaContext ctx = model.createContext(DEFAULT_N_CTX, DEFAULT_N_THREADS);
+        opts.applyModelDefaults(modelConfig);
+        int nCtx     = modelConfig.getNumCtx()    != null ? modelConfig.getNumCtx()    : DEFAULT_N_CTX;
+        int nThreads = modelConfig.getNumThreads() != null ? modelConfig.getNumThreads(): DEFAULT_N_THREADS;
+
+        try (LlamaContext ctx = model.createContext(nCtx, nThreads);
              LlamaContext.TokenStream tokens = ctx.generateTokens(prompt.toString(), opts.numPredict, opts.temperature)) {
 
             if (opts.stream) {
@@ -280,11 +338,31 @@ public class ApiServer {
         sendJson(ex, status, err);
     }
 
-    /** Parses the Ollama-style {@code stream} / {@code options.num_predict} / {@code options.temperature} fields. */
+    /**
+     * Prepend a system message to {@code prompt} in ChatML format when a
+     * system prompt is configured. For raw /api/generate the system prompt
+     * becomes a simple prefix the model is expected to "see" first.
+     */
+    private static String withSystemPrompt(String systemPrompt, String prompt) {
+        if (systemPrompt == null || systemPrompt.isEmpty()) return prompt;
+        return "<|im_start|>system\n" + systemPrompt + "<|im_end|>\n"
+             + "<|im_start|>user\n" + prompt + "<|im_end|>\n"
+             + "<|im_start|>assistant\n";
+    }
+
+    /**
+     * Parses the Ollama-style {@code stream} / {@code options.num_predict} /
+     * {@code options.temperature} fields from the JSON request.
+     *
+     * <p>Modelfile PARAMETER values fill in values that the request didn't
+     * explicitly set; call {@link #applyModelDefaults} after parsing.
+     */
     private static final class GenerationOptions {
         boolean stream = true;
-        int numPredict = DEFAULT_NUM_PREDICT;
-        float temperature = DEFAULT_TEMPERATURE;
+        int     numPredict   = DEFAULT_NUM_PREDICT;
+        float   temperature  = DEFAULT_TEMPERATURE;
+        boolean numPredictFromRequest  = false;
+        boolean temperatureFromRequest = false;
 
         static GenerationOptions from(JsonObject req) {
             GenerationOptions opts = new GenerationOptions();
@@ -295,12 +373,25 @@ public class ApiServer {
                 JsonObject o = req.getAsJsonObject("options");
                 if (o.has("num_predict")) {
                     opts.numPredict = o.get("num_predict").getAsInt();
+                    opts.numPredictFromRequest = true;
                 }
                 if (o.has("temperature")) {
                     opts.temperature = o.get("temperature").getAsFloat();
+                    opts.temperatureFromRequest = true;
                 }
             }
             return opts;
+        }
+
+        // Modelfile PARAMETER values override server defaults, but explicit
+        // request options always win over everything else.
+        void applyModelDefaults(ModelConfig m) {
+            if (!numPredictFromRequest && m.getNumPredict() != null) {
+                numPredict = m.getNumPredict();
+            }
+            if (!temperatureFromRequest && m.getTemperature() != null) {
+                temperature = m.getTemperature();
+            }
         }
     }
 }

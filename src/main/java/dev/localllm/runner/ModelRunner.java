@@ -23,7 +23,16 @@ public class ModelRunner {
         cmd.add("-m"); cmd.add(model.getPath());
         cmd.add("-i");
         cmd.add("--chat-template"); cmd.add("chatml");
-        cmd.add("-c"); cmd.add("4096");
+        cmd.add("-c"); cmd.add(model.getNumCtx() != null ? String.valueOf(model.getNumCtx()) : "4096");
+        if (model.getNumThreads() != null) {
+            cmd.add("-t"); cmd.add(String.valueOf(model.getNumThreads()));
+        }
+        if (model.getTemperature() != null) {
+            cmd.add("--temp"); cmd.add(String.valueOf(model.getTemperature()));
+        }
+        if (model.getSystemPrompt() != null && !model.getSystemPrompt().isEmpty()) {
+            cmd.add("--system"); cmd.add(model.getSystemPrompt());
+        }
 
         System.out.println("Starting " + model.getName() + "  (Ctrl+C to quit)");
         System.out.println();
