@@ -1,5 +1,5 @@
 #!/bin/bash
-# Maven不要のビルドスクリプト。依存JARを自動ダウンロードしてfat JARを生成する。
+# Build script — no Maven required. Downloads dependency JARs and produces a fat JAR.
 set -e
 
 GSON_VERSION="2.10.1"

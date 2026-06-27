@@ -27,10 +27,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Ollama互換のREST APIサーバー。
- * GET  /api/tags      モデル一覧
- * POST /api/generate  テキスト生成
- * POST /api/chat      チャット補完
+ * Ollama-compatible REST API server.
+ * GET  /api/tags      List registered models
+ * POST /api/generate  Single-shot text generation
+ * POST /api/chat      Chat completion
  *
  * Generation runs in-process via the JNI binding ({@link LlamaModel} /
  * {@link LlamaContext}) instead of shelling out to a llama.cpp binary, so
@@ -228,8 +228,8 @@ public class ApiServer {
             return;
         }
 
-        // ChatML形式でプロンプトを組み立てる。
-        // リクエストにsystemロールのメッセージがなく、Modelfileにsystem promptが設定されている場合は先頭に挿入する。
+        // Build the prompt in ChatML format.
+        // If the request contains no system-role message and the model has a system prompt configured, prepend it.
         boolean hasSystemMessage = false;
         for (int i = 0; i < messages.size(); i++) {
             if ("system".equals(messages.get(i).getAsJsonObject().get("role").getAsString())) {
