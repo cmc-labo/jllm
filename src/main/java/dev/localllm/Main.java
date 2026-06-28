@@ -8,7 +8,9 @@ import dev.localllm.runner.ModelRunner;
 import dev.localllm.server.ApiServer;
 
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
@@ -25,15 +27,16 @@ public class Main {
 
         String cmd = args[0];
         switch (cmd) {
-            case "list":   cmdList();         break;
-            case "add":    cmdAdd(args);      break;
-            case "create": cmdCreate(args);   break;
+            case "list":    cmdList();          break;
+            case "add":     cmdAdd(args);       break;
+            case "create":  cmdCreate(args);    break;
             case "rm":
-            case "remove": cmdRemove(args);   break;
-            case "run":    cmdRun(args);      break;
-            case "serve":  cmdServe(args);    break;
-            case "show":   cmdShow(args);     break;
-            case "info":   cmdInfo(args);     break;
+            case "remove":  cmdRemove(args);    break;
+            case "run":     cmdRun(args);       break;
+            case "serve":   cmdServe(args);     break;
+            case "show":    cmdShow(args);      break;
+            case "info":    cmdInfo(args);      break;
+            case "storage": cmdStorage();       break;
             default:
                 System.err.println("Unknown command: " + cmd);
                 printUsage();
@@ -49,33 +52,46 @@ public class Main {
             System.out.println("No models registered. Use 'add' or 'create' to register one.");
             return;
         }
-        System.out.printf("%-25s %-8s %-10s %s%n", "NAME", "FORMAT", "SIZE", "PATH");
-        System.out.println("-".repeat(80));
+        System.out.printf("%-25s %-8s %-10s %-9s %s%n", "NAME", "FORMAT", "SIZE", "STATUS", "PATH");
+        System.out.println("-".repeat(90));
+        long totalBytes = 0;
+        int missingCount = 0;
         for (ModelConfig m : models) {
-            System.out.printf("%-25s %-8s %-10s %s%n",
+            boolean exists = Files.exists(Paths.get(m.getPath()));
+            String status = exists ? "ok" : "missing";
+            System.out.printf("%-25s %-8s %-10s %-9s %s%n",
                 m.getName(),
                 m.getFormat() != null ? m.getFormat() : "-",
                 formatSize(m.getSizeBytes()),
+                status,
                 m.getPath());
+            if (exists) totalBytes += m.getSizeBytes();
+            else        missingCount++;
         }
+        System.out.println("-".repeat(90));
+        System.out.printf("%d model(s)  %s total on disk", models.size(), formatSize(totalBytes));
+        if (missingCount > 0) System.out.printf("  (%d file(s) missing — run 'storage' for details)", missingCount);
+        System.out.println();
     }
 
     private static void cmdAdd(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: local-llm add <name> --path <path> [--binary <binary>] [--format <fmt>]");
+            System.err.println("Usage: jllm add <name> --path <path> [--binary <path>] [--format <fmt>] [--managed]");
             System.exit(1);
         }
 
-        String name   = args[1];
-        String path   = null;
-        String binary = null;
-        String format = "gguf";
+        String name    = args[1];
+        String path    = null;
+        String binary  = null;
+        String format  = "gguf";
+        boolean managed = false;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
-                case "--path":   if (i + 1 < args.length) path   = args[++i]; break;
-                case "--binary": if (i + 1 < args.length) binary = args[++i]; break;
-                case "--format": if (i + 1 < args.length) format = args[++i]; break;
+                case "--path":    if (i + 1 < args.length) path   = args[++i]; break;
+                case "--binary":  if (i + 1 < args.length) binary = args[++i]; break;
+                case "--format":  if (i + 1 < args.length) format = args[++i]; break;
+                case "--managed": managed = true; break;
             }
         }
 
@@ -83,6 +99,18 @@ public class Main {
         if (!Files.exists(Paths.get(path))) {
             System.err.println("Model file not found: " + path);
             System.exit(1);
+        }
+
+        if (managed) {
+            Path managedDir = ModelRegistry.getManagedModelsDir();
+            Files.createDirectories(managedDir);
+            Path dest = managedDir.resolve(Paths.get(path).getFileName());
+            if (!dest.toAbsolutePath().equals(Paths.get(path).toAbsolutePath())) {
+                System.out.println("Copying to managed storage...");
+                Files.copy(Paths.get(path), dest, StandardCopyOption.REPLACE_EXISTING);
+                path = dest.toString();
+                System.out.println("Stored at: " + path);
+            }
         }
 
         if (binary == null) binary = detectLlamaBinary();
@@ -168,14 +196,31 @@ public class Main {
         printModelfileParams(model);
     }
 
-    private static void cmdRemove(String[] args) {
-        if (args.length < 2) { System.err.println("Usage: local-llm rm <name>"); System.exit(1); }
+    private static void cmdRemove(String[] args) throws Exception {
+        if (args.length < 2) { System.err.println("Usage: jllm rm <name> [--purge]"); System.exit(1); }
         String name = args[1];
-        if (registry.remove(name)) {
-            System.out.println("Removed '" + name + "'.");
-        } else {
+        boolean purge = false;
+        for (int i = 2; i < args.length; i++) {
+            if ("--purge".equals(args[i])) purge = true;
+        }
+
+        ModelConfig model = registry.get(name).orElse(null);
+        if (model == null) {
             System.err.println("Model '" + name + "' not found.");
             System.exit(1);
+        }
+
+        registry.remove(name);
+        System.out.println("Removed '" + name + "' from registry.");
+
+        if (purge) {
+            Path filePath = Paths.get(model.getPath());
+            if (Files.exists(filePath)) {
+                Files.delete(filePath);
+                System.out.println("Deleted file: " + filePath + " (" + formatSize(model.getSizeBytes()) + " freed)");
+            } else {
+                System.out.println("File not found on disk (already deleted): " + filePath);
+            }
         }
     }
 
@@ -241,6 +286,46 @@ public class Main {
         printModelfileParams(m);
     }
 
+    /** Show disk usage for all registered models. */
+    private static void cmdStorage() {
+        List<ModelConfig> models = registry.list();
+        Path managedDir = ModelRegistry.getManagedModelsDir();
+        System.out.println("Managed storage dir: " + managedDir);
+        System.out.println();
+
+        if (models.isEmpty()) {
+            System.out.println("No models registered.");
+            return;
+        }
+
+        System.out.printf("%-25s %-10s %-10s %s%n", "NAME", "SIZE", "STATUS", "PATH");
+        System.out.println("-".repeat(90));
+
+        long totalBytes = 0;
+        int missingCount = 0;
+        for (ModelConfig m : models) {
+            Path filePath = Paths.get(m.getPath());
+            boolean exists  = Files.exists(filePath);
+            boolean isManaged = filePath.toAbsolutePath().startsWith(managedDir.toAbsolutePath());
+            String status = !exists ? "missing" : isManaged ? "managed" : "external";
+            System.out.printf("%-25s %-10s %-10s %s%n",
+                m.getName(), formatSize(m.getSizeBytes()), status, m.getPath());
+            if (exists) totalBytes += m.getSizeBytes();
+            else        missingCount++;
+        }
+
+        System.out.println("-".repeat(90));
+        System.out.printf("Total: %d model(s)  %s on disk%n", models.size(), formatSize(totalBytes));
+        if (missingCount > 0) {
+            System.out.printf("       %d file(s) missing — remove stale entries with: jllm rm <name>%n", missingCount);
+        }
+        System.out.println();
+        System.out.println("Status legend:");
+        System.out.println("  managed   file lives under the managed storage dir (safe to purge via jllm rm --purge)");
+        System.out.println("  external  file is registered by path but not copied to managed storage");
+        System.out.println("  missing   registered path no longer exists on disk");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private static void printModelfileParams(ModelConfig m) {
@@ -296,13 +381,15 @@ public class Main {
         System.out.println("Usage: java -jar local-llm.jar <command> [options]");
         System.out.println();
         System.out.println("Commands:");
-        System.out.println("  list                                    List registered models");
+        System.out.println("  list                                    List registered models with disk status");
+        System.out.println("  storage                                 Show per-model disk usage summary");
         System.out.println("  add <name> --path <path>                Register a model by file path");
         System.out.println("             [--binary <path>]            Path to llama.cpp binary");
         System.out.println("             [--format <fmt>]             Model format (default: gguf)");
+        System.out.println("             [--managed]                  Copy file into managed storage (~/.local-llm/models/)");
         System.out.println("  create <name> -f <file>                 Create a model from a Modelfile or Jllmfile (.yaml/.yml)");
         System.out.println("                [--binary <path>]         Path to llama.cpp binary");
-        System.out.println("  rm <name>                               Remove a model");
+        System.out.println("  rm <name> [--purge]                     Remove a model (--purge also deletes the file)");
         System.out.println("  run <name>                              Start an interactive chat session");
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
         System.out.println("  show <name> [--yaml]                    Show model config (--yaml for Jllmfile format)");

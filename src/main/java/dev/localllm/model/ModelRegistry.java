@@ -15,8 +15,12 @@ import java.util.Optional;
 
 public class ModelRegistry {
 
-    private static final Path REGISTRY_DIR = Paths.get(System.getProperty("user.home"), ".local-llm");
+    private static final Path REGISTRY_DIR  = Paths.get(System.getProperty("user.home"), ".local-llm");
     private static final Path REGISTRY_FILE = REGISTRY_DIR.resolve("models.json");
+    private static final Path MANAGED_DIR   = REGISTRY_DIR.resolve("models");
+
+    /** Returns the directory where managed GGUF files are stored. */
+    public static Path getManagedModelsDir() { return MANAGED_DIR; }
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Type MODEL_LIST_TYPE = new TypeToken<List<ModelConfig>>() {}.getType();
 
