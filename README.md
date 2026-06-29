@@ -289,15 +289,95 @@ jllm rm phi3:mini --purge
 
 ## HTTP API
 
-The server exposes an Ollama-compatible REST API. `/api/generate` and `/api/chat` stream by
-default: the response is newline-delimited JSON (`application/x-ndjson`), one object per
-generated token, flushed as soon as the JNI layer produces it — not buffered until generation
-finishes. Pass `"stream": false` to instead get a single JSON object once generation completes.
+The embedded HTTP server is built on **Undertow** and exposes both an Ollama-compatible API
+(`/api/...`) and an OpenAI-compatible API (`/v1/...`).
+
+Streaming behaviour:
+- **Ollama endpoints** stream newline-delimited JSON (`application/x-ndjson`), one object per token.
+- **OpenAI endpoints** stream Server-Sent Events (`text/event-stream`), one `data:` line per token,
+  terminated with `data: [DONE]`.
+
+Pass `"stream": false` in the request body to receive a single JSON object instead of a stream.
+
+All endpoints respond with `Access-Control-Allow-Origin: *` CORS headers so browser clients can
+connect directly. `OPTIONS` preflight requests are handled automatically.
 
 The model named in `model` is loaded into memory on first use and kept resident for subsequent
 requests (no reload-per-request); each request gets its own short-lived inference context.
 
-### `POST /api/show` — Model details
+### Endpoints
+
+| Method | Path | Protocol | Description |
+|---|---|---|---|
+| `GET`  | `/api/tags`             | Ollama  | List registered models |
+| `POST` | `/api/show`             | Ollama  | Model details (Modelfile + parameters) |
+| `POST` | `/api/generate`         | Ollama  | Text generation |
+| `POST` | `/api/chat`             | Ollama  | Chat completion |
+| `GET`  | `/v1/models`            | OpenAI  | List models |
+| `POST` | `/v1/chat/completions`  | OpenAI  | Chat completion |
+| `POST` | `/v1/completions`       | OpenAI  | Text completion |
+
+### OpenAI: `GET /v1/models`
+
+```bash
+curl http://localhost:11434/v1/models
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "id": "phi3:mini", "object": "model", "created": 1719600000, "owned_by": "local-llm" }
+  ]
+}
+```
+
+### OpenAI: `POST /v1/chat/completions`
+
+```bash
+curl http://localhost:11434/v1/chat/completions \
+  -d '{
+    "model": "phi3:mini",
+    "messages": [{ "role": "user", "content": "Hello!" }],
+    "temperature": 0.7,
+    "max_tokens": 256,
+    "stream": true
+  }'
+```
+
+Streaming SSE response (default):
+
+```
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1719600000,"model":"phi3:mini","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1719600000,"model":"phi3:mini","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","created":1719600000,"model":"phi3:mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+Non-streaming (`"stream": false`):
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1719600000,
+  "model": "phi3:mini",
+  "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Hello! How can I help?" }, "finish_reason": "stop" }],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+### OpenAI: `POST /v1/completions`
+
+```bash
+curl http://localhost:11434/v1/completions \
+  -d '{ "model": "phi3:mini", "prompt": "Once upon a time", "max_tokens": 128 }'
+```
+
+### Ollama: `POST /api/show` — Model details
 
 ```bash
 curl http://localhost:11434/api/show -d '{"name": "phi3:mini"}'
@@ -423,7 +503,7 @@ local-llm-env/
     ├── runner/
     │   └── ModelRunner.java              # Runs llama.cpp as a subprocess (used by `run`)
     ├── server/
-    │   └── ApiServer.java                # Ollama-compatible HTTP API server (JNI, in-process, streaming)
+    │   └── ApiServer.java                # Undertow-based HTTP server: Ollama + OpenAI APIs, SSE streaming, CORS
     └── jni/
         ├── LlamaNative.java              # Raw native method declarations
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
@@ -449,7 +529,7 @@ local-llm-env/
 ## Notes
 
 - The registry file `~/.local-llm/models.json` persists across sessions. All config parameters (`temperature`, `num_predict`, `num_ctx`, `num_threads`, system prompt) are stored as part of each model's entry.
-- The API server uses the JDK's built-in `com.sun.net.httpserver.HttpServer` — no extra HTTP framework dependency.
+- The API server is built on [Undertow](https://undertow.io/) (embedded, no servlet container needed). It adds ~3 MB to the fat JAR.
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md). A model's `SYSTEM` prompt is injected as a `system` turn at the start of every chat — unless the request already includes a `system` role message, in which case the request takes precedence.
 - Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below).
 

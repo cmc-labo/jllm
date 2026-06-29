@@ -16,6 +16,28 @@ LOGBACK_CLASSIC_URL="https://repo1.maven.org/maven2/ch/qos/logback/logback-class
 LOGBACK_CORE_JAR="lib/logback-core-${LOGBACK_VERSION}.jar"
 LOGBACK_CORE_URL="https://repo1.maven.org/maven2/ch/qos/logback/logback-core/${LOGBACK_VERSION}/logback-core-${LOGBACK_VERSION}.jar"
 
+UNDERTOW_VERSION="2.3.14.Final"
+UNDERTOW_JAR="lib/undertow-core-${UNDERTOW_VERSION}.jar"
+UNDERTOW_URL="https://repo1.maven.org/maven2/io/undertow/undertow-core/${UNDERTOW_VERSION}/undertow-core-${UNDERTOW_VERSION}.jar"
+
+XNIO_VERSION="3.8.14.Final"
+XNIO_API_JAR="lib/xnio-api-${XNIO_VERSION}.jar"
+XNIO_API_URL="https://repo1.maven.org/maven2/org/jboss/xnio/xnio-api/${XNIO_VERSION}/xnio-api-${XNIO_VERSION}.jar"
+XNIO_NIO_JAR="lib/xnio-nio-${XNIO_VERSION}.jar"
+XNIO_NIO_URL="https://repo1.maven.org/maven2/org/jboss/xnio/xnio-nio/${XNIO_VERSION}/xnio-nio-${XNIO_VERSION}.jar"
+
+JBOSS_LOGGING_VERSION="3.5.3.Final"
+JBOSS_LOGGING_JAR="lib/jboss-logging-${JBOSS_LOGGING_VERSION}.jar"
+JBOSS_LOGGING_URL="https://repo1.maven.org/maven2/org/jboss/logging/jboss-logging/${JBOSS_LOGGING_VERSION}/jboss-logging-${JBOSS_LOGGING_VERSION}.jar"
+
+WILDFLY_COMMON_VERSION="1.7.0.Final"
+WILDFLY_COMMON_JAR="lib/wildfly-common-${WILDFLY_COMMON_VERSION}.jar"
+WILDFLY_COMMON_URL="https://repo1.maven.org/maven2/org/wildfly/common/wildfly-common/${WILDFLY_COMMON_VERSION}/wildfly-common-${WILDFLY_COMMON_VERSION}.jar"
+
+JBOSS_THREADS_VERSION="3.5.0.Final"
+JBOSS_THREADS_JAR="lib/jboss-threads-${JBOSS_THREADS_VERSION}.jar"
+JBOSS_THREADS_URL="https://repo1.maven.org/maven2/org/jboss/threads/jboss-threads/${JBOSS_THREADS_VERSION}/jboss-threads-${JBOSS_THREADS_VERSION}.jar"
+
 OUT_JAR="target/local-llm.jar"
 
 echo "=== local-llm build ==="
@@ -30,12 +52,19 @@ download_if_missing() {
     fi
 }
 
-download_if_missing "$GSON_JAR" "$GSON_URL"
-download_if_missing "$SLF4J_JAR" "$SLF4J_URL"
+download_if_missing "$GSON_JAR"           "$GSON_URL"
+download_if_missing "$SLF4J_JAR"          "$SLF4J_URL"
 download_if_missing "$LOGBACK_CLASSIC_JAR" "$LOGBACK_CLASSIC_URL"
-download_if_missing "$LOGBACK_CORE_JAR" "$LOGBACK_CORE_URL"
+download_if_missing "$LOGBACK_CORE_JAR"   "$LOGBACK_CORE_URL"
+download_if_missing "$UNDERTOW_JAR"       "$UNDERTOW_URL"
+download_if_missing "$XNIO_API_JAR"       "$XNIO_API_URL"
+download_if_missing "$XNIO_NIO_JAR"       "$XNIO_NIO_URL"
+download_if_missing "$JBOSS_LOGGING_JAR"  "$JBOSS_LOGGING_URL"
+download_if_missing "$WILDFLY_COMMON_JAR" "$WILDFLY_COMMON_URL"
+download_if_missing "$JBOSS_THREADS_JAR" "$JBOSS_THREADS_URL"
 
-CP="$GSON_JAR:$SLF4J_JAR:$LOGBACK_CLASSIC_JAR:$LOGBACK_CORE_JAR"
+CP="$GSON_JAR:$SLF4J_JAR:$LOGBACK_CLASSIC_JAR:$LOGBACK_CORE_JAR:\
+$UNDERTOW_JAR:$XNIO_API_JAR:$XNIO_NIO_JAR:$JBOSS_LOGGING_JAR:$WILDFLY_COMMON_JAR:$JBOSS_THREADS_JAR"
 
 echo "Compiling..."
 find src/main/java -name "*.java" | sort > /tmp/local_llm_sources.txt
@@ -67,6 +96,12 @@ jar xf "../../$GSON_JAR"
 jar xf "../../$SLF4J_JAR"
 jar xf "../../$LOGBACK_CORE_JAR"
 jar xf "../../$LOGBACK_CLASSIC_JAR"
+jar xf "../../$UNDERTOW_JAR"
+jar xf "../../$XNIO_API_JAR"
+jar xf "../../$XNIO_NIO_JAR"
+jar xf "../../$JBOSS_LOGGING_JAR"
+jar xf "../../$WILDFLY_COMMON_JAR"
+jar xf "../../$JBOSS_THREADS_JAR"
 # Keep META-INF/services (SLF4J binding discovery relies on it) but drop
 # the rest (per-jar manifests, module info, license files, ...) so they
 # don't collide when multiple dependency JARs are merged into one.
