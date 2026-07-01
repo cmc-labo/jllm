@@ -2,20 +2,22 @@
 
 A lightweight Java tool for managing and running local LLMs — similar to Ollama but minimal by design.
 
-Models are registered by pointing to a local GGUF file and (optionally) a [llama.cpp](https://github.com/ggerganov/llama.cpp) binary. The registry is stored in `~/.local-llm/models.json`. Large GGUF files can be imported into a managed storage directory (`~/.local-llm/models/`) and removed cleanly from there with a single command.
+Models are registered by pointing to a local GGUF file. The registry is stored in `~/.local-llm/models.json`. Large GGUF files can be imported into a managed storage directory (`~/.local-llm/models/`) and removed cleanly from there with a single command.
 
-`run` (interactive chat) shells out to a `llama-cli` binary. `serve` (the HTTP API server) instead runs inference in-process via a JNI binding to llama.cpp — see [JNI Binding](#jni-binding-devlocalllmjni) — so it needs `native/build/libllamajni.so` built rather than a `llama-cli` binary.
+Both `run` (interactive chat) and `serve` (HTTP API server) run inference in-process via a JNI binding to llama.cpp — no `llama-cli` subprocess required. If the JNI native library is not available, `run` falls back to a `llama-cli` subprocess automatically.
+
+The tool is extensible: drop a JAR into `~/.local-llm/plugins/` to add new **function-calling tools** or **prompt interceptors** without rebuilding the application.
 
 ## Requirements
 
 - Java 11+
 - A GGUF model file
-- For `run`: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-cli` binary)
-- For `serve`: a built `libllamajni.so` (see [Build steps](#build-steps) under JNI Binding)
+- For in-process inference: a built `libllamajni.so` (see [JNI Binding](#jni-binding-devlocalllmjni))
+- For `run` subprocess fallback only: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-cli` binary)
 
 ## Build
 
-**Without Maven** (recommended — downloads Gson, SLF4J, and Logback automatically):
+**Without Maven** (recommended — downloads Gson, SLF4J, Logback, and Undertow automatically):
 
 ```bash
 bash build.sh
@@ -56,10 +58,11 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `add <name> --path <path>` | Register a model by pointing to a GGUF file |
 | `create <name> -f <file>` | Create a model from a Modelfile or Jllmfile |
 | `rm <name> [--purge]` | Remove a model from the registry (optionally delete the file) |
-| `run <name>` | Start an interactive chat session |
+| `run <name>` | Start an interactive chat session with streaming output |
 | `serve [--port <port>]` | Start the HTTP API server (default: 11434) |
 | `show <name> [--yaml]` | Print the model's config (Modelfile or Jllmfile format) |
 | `info <name>` | Show model details |
+| `plugins` | List all loaded plugin tools and interceptors |
 
 ### `add` — Register a model
 
@@ -70,7 +73,7 @@ jllm add phi3:mini --path ~/models/phi3-mini-q4.gguf --binary /usr/local/bin/lla
 | Flag | Description |
 |---|---|
 | `--path <path>` | **(required)** Path to the GGUF model file |
-| `--binary <path>` | Path to `llama-cli`. Auto-detected if omitted |
+| `--binary <path>` | Path to `llama-cli`. Auto-detected if omitted (used only as subprocess fallback) |
 | `--format <fmt>` | Model format (default: `gguf`) |
 | `--managed` | Copy the file into `~/.local-llm/models/` (managed storage) before registering |
 
@@ -84,7 +87,7 @@ jllm create phi3:mini -f my-model.yaml
 | Flag | Description |
 |---|---|
 | `-f <path>`, `--file <path>` | **(required)** Path to the Modelfile or Jllmfile |
-| `--binary <path>` | Path to `llama-cli` for the `run` command |
+| `--binary <path>` | Path to `llama-cli` for the subprocess fallback |
 
 The file format is detected from the extension: `.yaml` / `.yml` / `Jllmfile` → YAML (Jllmfile); anything else → Modelfile (Ollama-compatible).
 
@@ -103,6 +106,46 @@ jllm rm phi3:mini --purge      # remove from registry AND delete the file
 jllm show phi3:mini            # Modelfile (Ollama-compatible) format
 jllm show phi3:mini --yaml     # Jllmfile (YAML) format
 ```
+
+---
+
+## Interactive chat (`jllm run`)
+
+```bash
+jllm run phi3:mini
+```
+
+Loads the model in-process via JNI and opens a streaming terminal REPL. Tokens appear character-by-character as they are generated.
+
+```
+Model    : phi3:mini
+Settings : temperature=0.80  max_tokens=512  context=4096
+Commands : /clear  /help  /quit
+------------------------------------------------------------
+
+You> Tell me a joke.
+
+Assistant> Why don't scientists trust atoms?
+Because they make up everything.
+
+You> /clear
+[History cleared]
+
+You> /quit
+Goodbye!
+```
+
+**REPL commands:**
+
+| Command | Description |
+|---|---|
+| `/clear` | Clear conversation history and reset context |
+| `/help` | Show available commands and loaded tools |
+| `/quit` | Exit (also: `/exit`, `/bye`, Ctrl+D) |
+
+**Multi-turn context:** conversation history is maintained across turns using ChatML format. Each generation re-processes the full accumulated history from position 0.
+
+**Subprocess fallback:** if `libllamajni.so` is not available, `run` falls back to launching `llama-cli` as a subprocess (requires `--binary` at registration time). The JNI path is always tried first.
 
 ---
 
@@ -229,6 +272,125 @@ jllm rm phi3:mini --purge
 
 ---
 
+## Plugin architecture
+
+jllm supports drop-in JAR plugins that add new capabilities without rebuilding the application.
+Plugins are discovered at startup from `~/.local-llm/plugins/`.
+
+Two plugin types are available:
+
+| Type | Interface | Effect |
+|---|---|---|
+| **Tool** | `LlmTool` | Function-calling tool the model can invoke during a conversation |
+| **Interceptor** | `PromptInterceptor` | Transforms the assembled ChatML prompt before each generation call |
+
+### Listing loaded plugins
+
+```bash
+jllm plugins
+```
+
+```
+Plugin directory: /home/user/.local-llm/plugins
+
+Tools (1):
+  NAME                  DESCRIPTION                                    SOURCE JAR
+  --------------------------------------------------------------------------------
+  weather               Get current weather for a location             weather-1.0.jar
+
+Interceptors (1):
+  PRIORITY  CLASS                                     SOURCE JAR
+  ----------------------------------------------------------------------
+  100       LoggingInterceptor                        logging-plugin.jar
+```
+
+### How tool calling works
+
+When at least one tool is loaded, jllm automatically appends tool-use instructions to the system prompt before each generation call. The model is told to reply with:
+
+```
+<tool_call>{"name":"TOOL_NAME","args":{...}}</tool_call>
+```
+
+jllm detects that pattern in the response, executes the tool, injects the result back into the conversation as a user message, and continues generation — up to 5 tool calls per user turn. This mechanism is model-agnostic and works with any instruction-following model.
+
+```
+You> What's the weather in Tokyo?
+
+Assistant> <tool_call>{"name":"weather","args":{"location":"Tokyo"}}</tool_call>
+[Tool result] Sunny, 28°C
+
+Assistant> The current weather in Tokyo is sunny with a temperature of 28°C.
+```
+
+### How interceptors work
+
+`PromptInterceptor.intercept(prompt)` receives the fully assembled ChatML prompt string and returns a (possibly modified) version. Interceptors are sorted by `getPriority()` (ascending) and applied as a pipeline. They run in both `jllm run` and `jllm serve`.
+
+Use cases: prompt logging, keyword substitution, adding a preamble or context injection.
+
+### Building a plugin JAR
+
+**Step 1 — Implement the interface:**
+
+```java
+// EchoTool.java
+import dev.localllm.plugin.LlmTool;
+import com.google.gson.*;
+
+public class EchoTool implements LlmTool {
+    @Override public String getName()             { return "echo"; }
+    @Override public String getDescription()      { return "Echoes the provided text back verbatim."; }
+    @Override public String getParametersSchema() {
+        return "{\"type\":\"object\","
+             + "\"properties\":{\"text\":{\"type\":\"string\"}},"
+             + "\"required\":[\"text\"]}";
+    }
+    @Override public String execute(String argsJson) throws Exception {
+        return new Gson().fromJson(argsJson, JsonObject.class)
+                         .get("text").getAsString();
+    }
+}
+```
+
+**Step 2 — Register via Java SPI:**
+
+Create `META-INF/services/dev.localllm.plugin.LlmTool` (or `...PromptInterceptor`) containing the fully-qualified class name:
+
+```
+EchoTool
+```
+
+**Step 3 — Build and install:**
+
+```bash
+# Compile against the fat JAR (which contains the plugin interfaces)
+javac -cp /path/to/local-llm.jar EchoTool.java
+
+# Package
+jar cf echo-tool.jar EchoTool.class META-INF/
+
+# Install
+mkdir -p ~/.local-llm/plugins/
+cp echo-tool.jar ~/.local-llm/plugins/
+
+# Verify
+jllm plugins
+```
+
+Full working examples (with build scripts) are in `examples/plugins/`:
+
+| Directory | Plugin type | Description |
+|---|---|---|
+| `echo-tool/` | `LlmTool` | Echoes back the text argument |
+| `logging-interceptor/` | `PromptInterceptor` | Appends every prompt to `~/.local-llm/prompt.log` |
+
+### Thread safety
+
+Plugin instances are shared across all concurrent requests in `jllm serve` mode. Both `LlmTool.execute()` and `PromptInterceptor.intercept()` may be called from multiple threads simultaneously — implementations must be thread-safe.
+
+---
+
 ## Parameter precedence
 
 At inference time, parameters are resolved in this order:
@@ -269,7 +431,7 @@ jllm show phi3:mini --yaml
 # Show raw model details
 jllm info phi3:mini
 
-# Interactive chat
+# Interactive streaming chat
 jllm run phi3:mini
 
 # Start API server on the default port (11434)
@@ -283,6 +445,9 @@ jllm rm phi3:mini
 
 # Remove from registry AND delete the file
 jllm rm phi3:mini --purge
+
+# List loaded plugins
+jllm plugins
 ```
 
 ---
@@ -304,6 +469,9 @@ connect directly. `OPTIONS` preflight requests are handled automatically.
 
 The model named in `model` is loaded into memory on first use and kept resident for subsequent
 requests (no reload-per-request); each request gets its own short-lived inference context.
+
+**Prompt interceptors** loaded from `~/.local-llm/plugins/` are applied to every prompt in all
+handlers — both Ollama and OpenAI endpoints.
 
 ### Endpoints
 
@@ -482,17 +650,21 @@ local-llm-env/
 ├── build.sh                              # Maven-free build script
 ├── jllm                                  # Shell wrapper (runs target/local-llm.jar)
 ├── pom.xml                               # Maven build file
+├── examples/
+│   └── plugins/
+│       ├── echo-tool/                    # Example LlmTool plugin (with build.sh)
+│       └── logging-interceptor/          # Example PromptInterceptor plugin
 ├── native/                               # JNI wrapper around llama.cpp's C API
 │   ├── CMakeLists.txt
 │   ├── build.sh
 │   └── llama_jni.cpp
 ├── native/dist/                          # Pre-built native libs for JAR bundling
-│   ├── linux-x86_64/libllamajni.so       #   (produced by native/build.sh --static)
+│   ├── linux-x86_64/libllamajni.so
 │   ├── linux-x86_64-cuda/libllamajni.so
 │   ├── osx-aarch64/libllamajni.dylib
 │   └── windows-x86_64/llamajni.dll
 ├── src/main/resources/
-│   └── logback.xml                       # Default Logback config (console, native logger at INFO)
+│   └── logback.xml                       # Default Logback config
 └── src/main/java/dev/localllm/
     ├── Main.java                         # CLI entry point
     ├── model/
@@ -500,10 +672,14 @@ local-llm-env/
     │   ├── Modelfile.java                # Modelfile parser and serializer (Ollama-compatible)
     │   ├── JllmfileParser.java           # Jllmfile parser and serializer (YAML format)
     │   └── ModelRegistry.java            # Persists registry to ~/.local-llm/models.json
+    ├── plugin/
+    │   ├── LlmTool.java                  # SPI: function-calling tool interface
+    │   ├── PromptInterceptor.java        # SPI: prompt transformation interface
+    │   └── PluginManager.java            # JAR scanner, URLClassLoader, interceptor chain
     ├── runner/
-    │   └── ModelRunner.java              # Runs llama.cpp as a subprocess (used by `run`)
+    │   └── ModelRunner.java              # Interactive REPL: JNI streaming + tool calling loop
     ├── server/
-    │   └── ApiServer.java                # Undertow-based HTTP server: Ollama + OpenAI APIs, SSE streaming, CORS
+    │   └── ApiServer.java                # Undertow HTTP server: Ollama + OpenAI APIs
     └── jni/
         ├── LlamaNative.java              # Raw native method declarations
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
@@ -519,9 +695,12 @@ local-llm-env/
 ```
 ~/.local-llm/
 ├── models.json          # Registry: all registered model metadata
-└── models/              # Managed storage (populated by jllm add --managed)
-    ├── phi3-mini.gguf
-    └── llama3-8b.gguf
+├── models/              # Managed storage (populated by jllm add --managed)
+│   ├── phi3-mini.gguf
+│   └── llama3-8b.gguf
+└── plugins/             # Plugin JARs (drop-in; loaded at startup)
+    ├── weather-1.0.jar
+    └── logging-plugin.jar
 ```
 
 ---
@@ -531,13 +710,14 @@ local-llm-env/
 - The registry file `~/.local-llm/models.json` persists across sessions. All config parameters (`temperature`, `num_predict`, `num_ctx`, `num_threads`, system prompt) are stored as part of each model's entry.
 - The API server is built on [Undertow](https://undertow.io/) (embedded, no servlet container needed). It adds ~3 MB to the fat JAR.
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md). A model's `SYSTEM` prompt is injected as a `system` turn at the start of every chat — unless the request already includes a `system` role message, in which case the request takes precedence.
-- Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below).
+- Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below). In interactive REPL mode, native INFO logs are suppressed after the model and context load — they only appear at startup.
+- Plugin JARs are each loaded in an isolated `URLClassLoader` (child of the application classloader), so multiple plugins with conflicting class names coexist safely.
 
 ---
 
 ## JNI Binding (`dev.localllm.jni`)
 
-In addition to the subprocess-based CLI above, this project includes a direct **JNI binding to llama.cpp's C API**, so Java code can run inference in-process (no `llama-cli` subprocess, no stdout parsing).
+In addition to the subprocess-based fallback, this project includes a direct **JNI binding to llama.cpp's C API**, so Java code can run inference in-process (no `llama-cli` subprocess, no stdout parsing). This is the default path for both `jllm run` and `jllm serve`.
 
 ### Why JNI
 
@@ -638,8 +818,7 @@ try (LlamaModel model = new LlamaModel("/path/to/model.gguf", /* nGpuLayers */ 0
     // Streaming via push callback:
     ctx.generateStreaming("Once upon a time", 128, 0.8f, piece -> System.out.print(piece));
 
-    // Streaming via pull-based Iterator/Iterable - e.g. to write each token
-    // straight to an HTTP response as it's produced (see ApiServer):
+    // Streaming via pull-based Iterator/Iterable (used by ApiServer):
     try (LlamaContext.TokenStream tokens = ctx.generateTokens("Once upon a time", 128, 0.8f)) {
         for (String piece : tokens) {
             System.out.print(piece);
