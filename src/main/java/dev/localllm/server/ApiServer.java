@@ -9,6 +9,7 @@ import dev.localllm.jni.LlamaModel;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
+import dev.localllm.plugin.PluginManager;
 import io.undertow.Handlers;
 import io.undertow.Undertow;
 import io.undertow.server.HttpHandler;
@@ -75,14 +76,20 @@ public class ApiServer {
 
     private final int port;
     private final ModelRegistry registry;
+    private final PluginManager plugins;
     private final Map<String, LlamaModel> loadedModels = new ConcurrentHashMap<>();
     private final Gson prettyGson;
     private final Gson compactGson;
 
     public ApiServer(int port, ModelRegistry registry) {
-        this.port       = port;
-        this.registry   = registry;
-        this.prettyGson = new GsonBuilder().setPrettyPrinting().create();
+        this(port, registry, PluginManager.EMPTY);
+    }
+
+    public ApiServer(int port, ModelRegistry registry, PluginManager plugins) {
+        this.port        = port;
+        this.registry    = registry;
+        this.plugins     = plugins != null ? plugins : PluginManager.EMPTY;
+        this.prettyGson  = new GsonBuilder().setPrettyPrinting().create();
         this.compactGson = new Gson();
     }
 
@@ -205,7 +212,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String effectivePrompt = withSystemPrompt(cfg.getSystemPrompt(), prompt);
+        String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(cfg.getSystemPrompt(), prompt));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
@@ -242,7 +249,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String prompt = chatMlPrompt(messages, cfg.getSystemPrompt());
+        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, cfg.getSystemPrompt()));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
@@ -293,7 +300,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String prompt = chatMlPrompt(messages, cfg.getSystemPrompt());
+        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, cfg.getSystemPrompt()));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
         String id    = "chatcmpl-" + shortUuid();
@@ -335,7 +342,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String effectivePrompt = withSystemPrompt(cfg.getSystemPrompt(), prompt);
+        String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(cfg.getSystemPrompt(), prompt));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
         String id    = "cmpl-" + shortUuid();

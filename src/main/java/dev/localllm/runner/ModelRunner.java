@@ -1,15 +1,22 @@
 package dev.localllm.runner;
 
 import ch.qos.logback.classic.Level;
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import dev.localllm.jni.LlamaContext;
 import dev.localllm.jni.LlamaModel;
 import dev.localllm.model.ModelConfig;
+import dev.localllm.plugin.LlmTool;
+import dev.localllm.plugin.PluginManager;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Runs an interactive chat session for a registered model.
@@ -17,20 +24,46 @@ import java.util.List;
  * <p>Two execution paths are supported:
  * <ol>
  *   <li><b>JNI (default)</b> — loads the GGUF file in-process via
- *       {@link LlamaModel} and streams tokens to the terminal as they are
- *       produced by {@link LlamaContext#generateStreaming}. No external
- *       binary is required.</li>
+ *       {@link LlamaModel} and streams tokens to the terminal as they arrive.
+ *       No external binary is required.</li>
  *   <li><b>Subprocess (fallback)</b> — shells out to a {@code llama-cli}
- *       binary when the JNI native library is not available. Used only if
- *       {@code --binary} was supplied at registration time.</li>
+ *       binary when the JNI native library is not available.</li>
  * </ol>
+ *
+ * <p>When a {@link PluginManager} is supplied:
+ * <ul>
+ *   <li>{@link dev.localllm.plugin.PromptInterceptor}s are applied to every
+ *       assembled ChatML prompt before it reaches the model.</li>
+ *   <li>{@link LlmTool}s are advertised in the system prompt; the model may
+ *       reply with {@code <tool_call>{...}</tool_call>} and jllm will execute
+ *       the tool and inject the result back into the conversation (up to
+ *       {@value #MAX_TOOL_TURNS} times per user message).</li>
+ * </ul>
  */
 public class ModelRunner {
 
-    private static final int   DEFAULT_N_CTX      = 4096;
-    private static final int   DEFAULT_N_THREADS  = Math.max(1, Runtime.getRuntime().availableProcessors());
-    private static final float DEFAULT_TEMPERATURE = 0.8f;
-    private static final int   DEFAULT_NUM_PREDICT = 512;
+    private static final int   DEFAULT_N_CTX       = 4096;
+    private static final int   DEFAULT_N_THREADS   = Math.max(1, Runtime.getRuntime().availableProcessors());
+    private static final float DEFAULT_TEMPERATURE  = 0.8f;
+    private static final int   DEFAULT_NUM_PREDICT  = 512;
+
+    /** Maximum consecutive tool calls before returning control to the user. */
+    private static final int MAX_TOOL_TURNS = 5;
+
+    private static final Pattern TOOL_CALL_RE =
+            Pattern.compile("<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>", Pattern.DOTALL);
+
+    private static final Gson GSON = new Gson();
+
+    private final PluginManager plugins;
+
+    public ModelRunner() {
+        this(PluginManager.EMPTY);
+    }
+
+    public ModelRunner(PluginManager plugins) {
+        this.plugins = plugins != null ? plugins : PluginManager.EMPTY;
+    }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -88,21 +121,31 @@ public class ModelRunner {
         int   nThreads    = model.getNumThreads()  != null ? model.getNumThreads()  : DEFAULT_N_THREADS;
         float temperature = model.getTemperature() != null ? model.getTemperature() : DEFAULT_TEMPERATURE;
         int   numPredict  = model.getNumPredict()  != null ? model.getNumPredict()  : DEFAULT_NUM_PREDICT;
-        String system     = model.getSystemPrompt();
+        String baseSystem = model.getSystemPrompt();
 
-        printHeader(model.getName(), system, temperature, numPredict, nCtx);
+        // If tools are loaded, append tool-use instructions to the system prompt.
+        String effectiveSystem = plugins.hasTools()
+                ? buildSystemWithTools(baseSystem, plugins.getTools())
+                : baseSystem;
 
-        // history: alternating [role, content] pairs
-        List<String[]> history = new ArrayList<>();
+        printHeader(model.getName(), baseSystem, temperature, numPredict, nCtx);
+        if (plugins.hasTools()) {
+            System.out.printf("Tools    : %d loaded (%s)%n",
+                    plugins.getTools().size(),
+                    plugins.getTools().stream().map(LlmTool::getName)
+                           .reduce((a, b) -> a + ", " + b).orElse(""));
+        }
+        if (plugins.hasInterceptors()) {
+            System.out.printf("Intercept: %d loaded%n", plugins.getInterceptors().size());
+        }
+
+        List<String[]> history = new ArrayList<>(); // [role, content] pairs
 
         try (LlamaModel llama = new LlamaModel(model.getPath(), 0);
              BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in))) {
 
-            // Create context once; reuse across turns (llama.cpp re-encodes the
-            // full prompt each call, overwriting the KV cache from position 0).
+            // Create context once; reuse across turns.
             LlamaContext ctx = llama.createContext(nCtx, nThreads);
-
-            // Suppress verbose native INFO logs now that model + context are ready.
             quietNativeLogs();
 
             try {
@@ -123,29 +166,45 @@ public class ModelRunner {
                         continue;
                     }
                     if ("/help".equals(input)) {
-                        printHelp();
+                        printHelp(plugins);
                         continue;
                     }
                     if (input.isEmpty()) continue;
 
-                    // ── generate ───────────────────────────────────────────
+                    // ── inner tool-call loop ───────────────────────────────
                     history.add(new String[]{"user", input});
-                    String prompt = buildPrompt(history, system);
 
-                    System.out.print("\nAssistant> ");
-                    System.out.flush();
+                    for (int toolTurn = 0; toolTurn <= MAX_TOOL_TURNS; toolTurn++) {
+                        if (toolTurn == MAX_TOOL_TURNS) {
+                            System.out.println("[Reached max tool calls (" + MAX_TOOL_TURNS + ") — returning to prompt]");
+                            break;
+                        }
 
-                    StringBuilder response = new StringBuilder();
-                    ctx.generateStreaming(prompt, numPredict, temperature, piece -> {
-                        System.out.print(piece);
+                        String prompt = buildPrompt(history, effectiveSystem);
+                        prompt = plugins.applyInterceptors(prompt);
+
+                        System.out.print("\nAssistant> ");
                         System.out.flush();
-                        response.append(piece);
-                    });
-                    System.out.println();
 
-                    String assistantText = response.toString().trim();
-                    if (!assistantText.isEmpty()) {
-                        history.add(new String[]{"assistant", assistantText});
+                        StringBuilder response = new StringBuilder();
+                        ctx.generateStreaming(prompt, numPredict, temperature, piece -> {
+                            System.out.print(piece);
+                            System.out.flush();
+                            response.append(piece);
+                        });
+                        System.out.println();
+
+                        String text = response.toString().trim();
+                        history.add(new String[]{"assistant", text});
+
+                        // Detect tool call — only when tools are actually loaded.
+                        if (!plugins.hasTools()) break;
+                        String callJson = extractToolCall(text);
+                        if (callJson == null) break;
+
+                        String result = runToolCall(callJson, plugins.getTools());
+                        System.out.println("[Tool result] " + result);
+                        history.add(new String[]{"user", "[Tool result] " + result});
                     }
                 }
             } finally {
@@ -163,8 +222,8 @@ public class ModelRunner {
         cmd.add("-i");
         cmd.add("--chat-template"); cmd.add("chatml");
         cmd.add("-c"); cmd.add(model.getNumCtx() != null ? String.valueOf(model.getNumCtx()) : "4096");
-        if (model.getNumThreads()  != null) { cmd.add("-t");       cmd.add(String.valueOf(model.getNumThreads())); }
-        if (model.getTemperature() != null) { cmd.add("--temp");   cmd.add(String.valueOf(model.getTemperature())); }
+        if (model.getNumThreads()  != null) { cmd.add("-t");     cmd.add(String.valueOf(model.getNumThreads())); }
+        if (model.getTemperature() != null) { cmd.add("--temp"); cmd.add(String.valueOf(model.getTemperature())); }
         if (model.getSystemPrompt() != null && !model.getSystemPrompt().isEmpty()) {
             cmd.add("--system"); cmd.add(model.getSystemPrompt());
         }
@@ -178,15 +237,15 @@ public class ModelRunner {
         if (exitCode != 0) System.err.println("Model exited with code: " + exitCode);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Prompt builders ───────────────────────────────────────────────────────
 
     /**
      * Builds a ChatML-formatted prompt from the full conversation history.
-     * A new LlamaContext is created per turn so the entire history is
-     * re-processed on each call; this keeps context management simple at the
-     * cost of O(n²) total decode work for long conversations.
+     * The entire history is re-processed on each call (new decode from position 0)
+     * which keeps context management simple at the cost of O(n²) decode work
+     * for long conversations.
      */
-    private static String buildPrompt(List<String[]> history, String system) {
+    static String buildPrompt(List<String[]> history, String system) {
         StringBuilder sb = new StringBuilder();
         if (system != null && !system.isEmpty()) {
             sb.append("<|im_start|>system\n").append(system).append("<|im_end|>\n");
@@ -197,6 +256,65 @@ public class ModelRunner {
         }
         return sb.append("<|im_start|>assistant\n").toString();
     }
+
+    /**
+     * Appends tool-use instructions and tool descriptions to the system prompt.
+     * Returns the base system prompt unchanged if no tools are provided.
+     */
+    static String buildSystemWithTools(String baseSystem, List<LlmTool> tools) {
+        if (tools.isEmpty()) return baseSystem;
+
+        StringBuilder sb = new StringBuilder();
+        if (baseSystem != null && !baseSystem.isEmpty()) {
+            sb.append(baseSystem).append("\n\n");
+        }
+        sb.append("You have access to the following tools. To invoke a tool, reply with ONLY:\n");
+        sb.append("<tool_call>{\"name\":\"TOOL_NAME\",\"args\":{...}}</tool_call>\n");
+        sb.append("Do not include any other text when invoking a tool.\n\n");
+        sb.append("Available tools:\n");
+        for (LlmTool tool : tools) {
+            sb.append("- ").append(tool.getName()).append(": ").append(tool.getDescription()).append("\n");
+            sb.append("  Parameters: ").append(tool.getParametersSchema()).append("\n");
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    // ── Tool call execution ───────────────────────────────────────────────────
+
+    /** Returns the JSON payload inside {@code <tool_call>...</tool_call>}, or {@code null}. */
+    static String extractToolCall(String text) {
+        Matcher m = TOOL_CALL_RE.matcher(text);
+        return m.find() ? m.group(1).trim() : null;
+    }
+
+    /** Parse a tool call JSON, dispatch to the matching tool, and return the result string. */
+    static String runToolCall(String callJson, List<LlmTool> tools) {
+        String toolName = null;
+        String argsJson = "{}";
+        try {
+            JsonObject call = GSON.fromJson(callJson, JsonObject.class);
+            toolName = call.get("name").getAsString();
+            JsonElement args = call.get("args");
+            if (args != null && args.isJsonObject()) argsJson = args.toString();
+        } catch (Exception e) {
+            return "[Error: could not parse tool_call JSON: " + e.getMessage() + "]";
+        }
+
+        final String name = toolName;
+        LlmTool tool = tools.stream().filter(t -> t.getName().equals(name)).findFirst().orElse(null);
+        if (tool == null) {
+            return "[Error: no tool named '" + name + "'. Available: "
+                    + tools.stream().map(LlmTool::getName).reduce((a, b) -> a + ", " + b).orElse("none") + "]";
+        }
+
+        try {
+            return tool.execute(argsJson);
+        } catch (Exception e) {
+            return "[Error executing '" + name + "': " + e.getMessage() + "]";
+        }
+    }
+
+    // ── Terminal helpers ──────────────────────────────────────────────────────
 
     private static String readUserInput(BufferedReader stdin) throws Exception {
         System.out.print("\nYou> ");
@@ -218,6 +336,21 @@ public class ModelRunner {
         System.out.println("-".repeat(60));
     }
 
+    private static void printHelp(PluginManager pm) {
+        System.out.println();
+        System.out.println("  /clear   Clear conversation history and start fresh");
+        System.out.println("  /help    Show this message");
+        System.out.println("  /quit    Exit the chat  (also: /exit, /bye, Ctrl+D)");
+        if (pm.hasTools()) {
+            System.out.println();
+            System.out.println("  Loaded tools:");
+            for (LlmTool t : pm.getTools()) {
+                System.out.printf("    %-18s %s%n", t.getName(), t.getDescription());
+            }
+        }
+        System.out.println();
+    }
+
     /** Drops native library INFO chatter once the model and context are loaded. */
     private static void quietNativeLogs() {
         try {
@@ -227,13 +360,5 @@ public class ModelRunner {
         } catch (ClassCastException ignored) {
             // Non-logback binding in use; skip silently.
         }
-    }
-
-    private static void printHelp() {
-        System.out.println();
-        System.out.println("  /clear   Clear conversation history and start fresh");
-        System.out.println("  /help    Show this message");
-        System.out.println("  /quit    Exit the chat  (also: /exit, /bye, Ctrl+D)");
-        System.out.println();
     }
 }

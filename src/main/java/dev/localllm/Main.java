@@ -4,6 +4,9 @@ import dev.localllm.model.JllmfileParser;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
+import dev.localllm.plugin.LlmTool;
+import dev.localllm.plugin.PluginManager;
+import dev.localllm.plugin.PromptInterceptor;
 import dev.localllm.runner.ModelRunner;
 import dev.localllm.server.ApiServer;
 
@@ -18,6 +21,15 @@ import java.util.Locale;
 public class Main {
 
     private static final ModelRegistry registry = new ModelRegistry();
+
+    // Loaded once at startup; shared across commands.
+    private static final PluginManager plugins;
+
+    static {
+        PluginManager pm = new PluginManager(ModelRegistry.getPluginsDir());
+        pm.load();
+        plugins = pm;
+    }
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
@@ -37,6 +49,7 @@ public class Main {
             case "show":    cmdShow(args);      break;
             case "info":    cmdInfo(args);      break;
             case "storage": cmdStorage();       break;
+            case "plugins": cmdPlugins();       break;
             default:
                 System.err.println("Unknown command: " + cmd);
                 printUsage();
@@ -231,7 +244,7 @@ public class Main {
             System.err.println("Model '" + args[1] + "' not found. Run 'list' to see available models.");
             System.exit(1);
         }
-        new ModelRunner().runInteractive(model);
+        new ModelRunner(plugins).runInteractive(model);
     }
 
     private static void cmdServe(String[] args) throws Exception {
@@ -242,7 +255,7 @@ public class Main {
             }
         }
         System.out.println("Starting local-llm server on http://localhost:" + port);
-        new ApiServer(port, registry).start();
+        new ApiServer(port, registry, plugins).start();
     }
 
     /**
@@ -326,6 +339,52 @@ public class Main {
         System.out.println("  missing   registered path no longer exists on disk");
     }
 
+    /** Show all currently loaded plugins (tools and interceptors). */
+    private static void cmdPlugins() {
+        Path pluginDir = ModelRegistry.getPluginsDir();
+        System.out.println("Plugin directory: " + pluginDir);
+        System.out.println();
+
+        List<LlmTool> tools = plugins.getTools();
+        List<PromptInterceptor> interceptors = plugins.getInterceptors();
+
+        if (tools.isEmpty() && interceptors.isEmpty()) {
+            System.out.println("No plugins loaded.");
+            System.out.println();
+            System.out.println("To add a plugin:");
+            System.out.println("  1. Implement LlmTool or PromptInterceptor (see examples/plugins/)");
+            System.out.println("  2. Add META-INF/services/dev.localllm.plugin.<Interface> to your JAR");
+            System.out.println("  3. Drop the JAR into: " + pluginDir);
+            return;
+        }
+
+        System.out.printf("Tools (%d):%n", tools.size());
+        if (tools.isEmpty()) {
+            System.out.println("  (none)");
+        } else {
+            System.out.printf("  %-20s  %-45s  %s%n", "NAME", "DESCRIPTION", "SOURCE JAR");
+            System.out.println("  " + "-".repeat(80));
+            for (LlmTool t : tools) {
+                String desc = t.getDescription();
+                if (desc.length() > 44) desc = desc.substring(0, 41) + "...";
+                System.out.printf("  %-20s  %-45s  %s%n", t.getName(), desc, plugins.getSourceJar(t));
+            }
+        }
+
+        System.out.println();
+        System.out.printf("Interceptors (%d):%n", interceptors.size());
+        if (interceptors.isEmpty()) {
+            System.out.println("  (none)");
+        } else {
+            System.out.printf("  %-8s  %-40s  %s%n", "PRIORITY", "CLASS", "SOURCE JAR");
+            System.out.println("  " + "-".repeat(70));
+            for (PromptInterceptor ic : interceptors) {
+                System.out.printf("  %-8d  %-40s  %s%n",
+                        ic.getPriority(), ic.getClass().getSimpleName(), plugins.getSourceJar(ic));
+            }
+        }
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private static void printModelfileParams(ModelConfig m) {
@@ -394,6 +453,7 @@ public class Main {
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
         System.out.println("  show <name> [--yaml]                    Show model config (--yaml for Jllmfile format)");
         System.out.println("  info <name>                             Show model details");
+        System.out.println("  plugins                                 List loaded plugin tools and interceptors");
         System.out.println();
         System.out.println("Modelfile example (Ollama-compatible):");
         System.out.println("  FROM /path/to/model.gguf");
