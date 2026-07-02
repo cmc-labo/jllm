@@ -59,7 +59,7 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `create <name> -f <file>` | Create a model from a Modelfile or Jllmfile |
 | `rm <name> [--purge]` | Remove a model from the registry (optionally delete the file) |
 | `run <name>` | Start an interactive chat session with streaming output |
-| `serve [--port <port>]` | Start the HTTP API server (default: 11434) |
+| `serve [--port <port>] [--max-concurrent <n>]` | Start the HTTP API server (default port: 11434) |
 | `show <name> [--yaml]` | Print the model's config (Modelfile or Jllmfile format) |
 | `info <name>` | Show model details |
 | `plugins` | List all loaded plugin tools and interceptors |
@@ -106,6 +106,21 @@ jllm rm phi3:mini --purge      # remove from registry AND delete the file
 jllm show phi3:mini            # Modelfile (Ollama-compatible) format
 jllm show phi3:mini --yaml     # Jllmfile (YAML) format
 ```
+
+### `serve` — Start the HTTP API server
+
+```bash
+jllm serve
+jllm serve --port 8080
+jllm serve --max-concurrent 4
+```
+
+| Flag | Description |
+|---|---|
+| `--port <port>` | Port to listen on (default: `11434`) |
+| `--max-concurrent <n>` | Maximum number of inference calls that run simultaneously (default: CPU core count). Extra requests wait until a slot is free. |
+
+On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project Loom) — created instantly, with no OS thread per connection. Requests blocked on the semaphore waiting for an inference slot unmount their virtual thread so no OS thread is wasted. On **Java 11–20**, a cached platform thread pool is used instead; the semaphore still applies.
 
 ---
 
@@ -440,6 +455,9 @@ jllm serve
 # Start API server on a custom port
 jllm serve --port 8080
 
+# Limit to 2 simultaneous inference calls (excess requests queue)
+jllm serve --max-concurrent 2
+
 # Remove from registry (file stays on disk)
 jllm rm phi3:mini
 
@@ -456,6 +474,15 @@ jllm plugins
 
 The embedded HTTP server is built on **Undertow** and exposes both an Ollama-compatible API
 (`/api/...`) and an OpenAI-compatible API (`/v1/...`).
+
+### Concurrency model
+
+Each incoming request is dispatched to a dedicated thread:
+
+- **Java 21+** — a **Virtual Thread** (Project Loom). Virtual threads are created instantly (no OS thread per connection), so thousands of concurrent SSE clients or chat sessions cost almost nothing in memory or scheduling overhead. A request blocked waiting for an inference slot (see below) parks the virtual thread rather than holding an OS thread.
+- **Java 11–20** — a platform thread from a cached thread pool.
+
+Inference is serialized by model (llama.cpp contexts are not reentrant), but bounded by `--max-concurrent` (default: CPU core count). Requests that arrive while all inference slots are busy wait on a semaphore — the virtual thread unmounts; no OS thread is consumed while waiting.
 
 Streaming behaviour:
 - **Ollama endpoints** stream newline-delimited JSON (`application/x-ndjson`), one object per token.
@@ -709,6 +736,7 @@ local-llm-env/
 
 - The registry file `~/.local-llm/models.json` persists across sessions. All config parameters (`temperature`, `num_predict`, `num_ctx`, `num_threads`, system prompt) are stored as part of each model's entry.
 - The API server is built on [Undertow](https://undertow.io/) (embedded, no servlet container needed). It adds ~3 MB to the fat JAR.
+- On Java 21+, the server uses **Virtual Threads** (Project Loom) for lightweight multi-user concurrency. The source is compiled with `-source 11` for compatibility; virtual thread support is detected and enabled at runtime via reflection. No code changes or flags are needed — run with Java 21+ and virtual threads activate automatically.
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md). A model's `SYSTEM` prompt is injected as a `system` turn at the start of every chat — unless the request already includes a `system` role message, in which case the request takes precedence.
 - Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below). In interactive REPL mode, native INFO logs are suppressed after the model and context load — they only appear at startup.
 - Plugin JARs are each loaded in an isolated `URLClassLoader` (child of the application classloader), so multiple plugins with conflicting class names coexist safely.
