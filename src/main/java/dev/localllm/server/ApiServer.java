@@ -14,13 +14,13 @@ import io.undertow.Handlers;
 import io.undertow.Undertow;
 import io.undertow.server.HttpHandler;
 import io.undertow.server.HttpServerExchange;
-import io.undertow.server.handlers.BlockingHandler;
 import io.undertow.util.Headers;
 import io.undertow.util.HttpString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -30,30 +30,38 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 
 /**
  * Embedded HTTP server with both Ollama-compatible and OpenAI-compatible REST APIs.
  *
- * Ollama API:
- *   GET  /api/tags               list registered models
- *   POST /api/show               model details (Modelfile + parameters)
- *   POST /api/generate           text generation  — NDJSON stream
- *   POST /api/chat               chat completion  — NDJSON stream
+ * <h2>Thread model</h2>
+ * On Java 21+, each HTTP request is dispatched to a new <b>Virtual Thread</b>
+ * (Project Loom). Virtual threads are JVM-managed, extremely lightweight (a few
+ * hundred bytes each), and unmount from their carrier OS thread whenever they block
+ * at the Java level — so thousands of concurrent connections need only a handful of
+ * OS threads. On older JVMs, a cached platform-thread pool is used instead.
  *
- * OpenAI API:
- *   GET  /v1/models              list models
- *   POST /v1/chat/completions    chat completion  — SSE stream
- *   POST /v1/completions         text completion  — SSE stream
+ * <p>Inference (JNI-level {@code llama_decode}) runs on the {@link LlamaContext.TokenStream}
+ * producer thread, not the handler's virtual thread. The handler blocks on
+ * {@link java.util.concurrent.SynchronousQueue#take()} between tokens — a pure Java
+ * block — so the carrier OS thread is released between every token during SSE streaming.
  *
- * Streaming behaviour:
- *   Ollama endpoints use newline-delimited JSON (application/x-ndjson).
- *   OpenAI endpoints use Server-Sent Events (text/event-stream), terminated
- *   with the conventional "data: [DONE]" line.
- *   Pass "stream": false in the request body to receive a single JSON object.
+ * <h2>Concurrency control</h2>
+ * A {@link Semaphore} limits the number of simultaneous LLM inference calls.
+ * Because LLM inference is CPU-intensive (each call may saturate all cores), allowing
+ * unbounded concurrent inferences would thrash the machine. The limit is set with
+ * {@code --max-concurrent} (default: number of CPU cores) and only counts active
+ * context allocations; requests waiting for a slot are parked cheaply on virtual threads.
  *
- * Inference runs in-process via the JNI binding (LlamaModel / LlamaContext).
- * Each registered model is loaded once on first use and kept resident;
- * each HTTP request gets its own short-lived LlamaContext.
+ * <h2>APIs</h2>
+ * Ollama:  GET /api/tags  POST /api/show  POST /api/generate  POST /api/chat<br>
+ * OpenAI:  GET /v1/models  POST /v1/chat/completions  POST /v1/completions
+ *
+ * <p>Pass {@code "stream": false} for a single JSON response instead of a stream.
+ * All endpoints include {@code Access-Control-Allow-Origin: *} CORS headers.
  */
 public class ApiServer {
 
@@ -61,11 +69,12 @@ public class ApiServer {
 
     // Server-wide defaults — overridden by Modelfile PARAMETER values, which
     // are in turn overridden by per-request options.
-    private static final int   DEFAULT_N_CTX      = 4096;
-    private static final int   DEFAULT_N_THREADS  = Math.max(1, Runtime.getRuntime().availableProcessors());
-    private static final float DEFAULT_TEMPERATURE = 0.8f;
-    private static final int   DEFAULT_NUM_PREDICT = 200;
-    private static final int   DEFAULT_CHAT_PREDICT = 500;
+    private static final int   DEFAULT_N_CTX        = 4096;
+    private static final int   DEFAULT_N_THREADS    = Math.max(1, Runtime.getRuntime().availableProcessors());
+    private static final float DEFAULT_TEMPERATURE   = 0.8f;
+    private static final int   DEFAULT_NUM_PREDICT   = 200;
+    private static final int   DEFAULT_CHAT_PREDICT  = 500;
+    private static final int   DEFAULT_MAX_CONCURRENT = Runtime.getRuntime().availableProcessors();
 
     // Pre-allocated HttpString instances for headers used on every response.
     private static final HttpString HDR_CORS_ORIGIN  = new HttpString("Access-Control-Allow-Origin");
@@ -74,23 +83,83 @@ public class ApiServer {
     private static final HttpString HDR_CACHE_CTRL   = new HttpString("Cache-Control");
     private static final HttpString HDR_X_ACCEL_BUF  = new HttpString("X-Accel-Buffering");
 
+    // Detected once at class-load time; true on Java 21+.
+    private static final boolean VIRTUAL_THREADS_AVAILABLE = detectVirtualThreads();
+
     private final int port;
     private final ModelRegistry registry;
     private final PluginManager plugins;
+    private final int maxConcurrent;
+
+    // Each HTTP request runs on its own virtual thread (Java 21+) or daemon
+    // platform thread (Java < 21). Switching from BlockingHandler's default
+    // XNIO worker pool to this executor is the only change needed for Loom.
+    private final ExecutorService requestExecutor;
+
+    // Caps simultaneous LLM inference calls. Requests that exceed the limit
+    // park cheaply on virtual threads instead of creating more OS threads.
+    private final Semaphore inferenceSemaphore;
+
     private final Map<String, LlamaModel> loadedModels = new ConcurrentHashMap<>();
     private final Gson prettyGson;
     private final Gson compactGson;
 
     public ApiServer(int port, ModelRegistry registry) {
-        this(port, registry, PluginManager.EMPTY);
+        this(port, registry, PluginManager.EMPTY, DEFAULT_MAX_CONCURRENT);
     }
 
     public ApiServer(int port, ModelRegistry registry, PluginManager plugins) {
-        this.port        = port;
-        this.registry    = registry;
-        this.plugins     = plugins != null ? plugins : PluginManager.EMPTY;
-        this.prettyGson  = new GsonBuilder().setPrettyPrinting().create();
-        this.compactGson = new Gson();
+        this(port, registry, plugins, DEFAULT_MAX_CONCURRENT);
+    }
+
+    public ApiServer(int port, ModelRegistry registry, PluginManager plugins, int maxConcurrent) {
+        this.port              = port;
+        this.registry          = registry;
+        this.plugins           = plugins != null ? plugins : PluginManager.EMPTY;
+        this.maxConcurrent     = maxConcurrent;
+        this.requestExecutor   = createExecutor();
+        this.inferenceSemaphore = new Semaphore(maxConcurrent);
+        this.prettyGson        = new GsonBuilder().setPrettyPrinting().create();
+        this.compactGson       = new Gson();
+    }
+
+    // ── Virtual thread detection and executor creation ────────────────────────
+
+    /**
+     * Returns true if the current JVM supports virtual threads (Java 21+).
+     * Uses a method lookup rather than {@code Runtime.version()} so it compiles
+     * on Java 11 without source-level changes.
+     */
+    private static boolean detectVirtualThreads() {
+        try {
+            Executors.class.getMethod("newVirtualThreadPerTaskExecutor");
+            return true;
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Creates a virtual-thread-per-task executor on Java 21+, or a cached
+     * platform-thread pool on older JVMs. Both behave identically from
+     * Undertow's perspective: {@link BlockingHandler} dispatches each request
+     * to the executor and the handler runs to completion on that thread.
+     */
+    private static ExecutorService createExecutor() {
+        if (VIRTUAL_THREADS_AVAILABLE) {
+            try {
+                Method m = Executors.class.getMethod("newVirtualThreadPerTaskExecutor");
+                return (ExecutorService) m.invoke(null);
+            } catch (Exception e) {
+                LOG.warn("Failed to create virtual thread executor, falling back to platform threads", e);
+            }
+        }
+        // Fallback: unbounded cached pool of daemon platform threads.
+        return Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "jllm-worker");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public void start() throws Exception {
@@ -115,6 +184,13 @@ public class ApiServer {
 
         System.out.printf("Listening on http://localhost:%d%n", port);
         System.out.println();
+        if (VIRTUAL_THREADS_AVAILABLE) {
+            System.out.println("Threads          : Virtual (Java 21+) — lightweight, unmount between tokens");
+        } else {
+            System.out.println("Threads          : Platform (cached pool) — upgrade to Java 21+ for Virtual Threads");
+        }
+        System.out.printf("Max concurrent   : %d inference slot(s) (--max-concurrent to change)%n", maxConcurrent);
+        System.out.println();
         System.out.println("Ollama-compatible:");
         System.out.printf("  GET  /api/tags              http://localhost:%d/api/tags%n", port);
         System.out.printf("  POST /api/show              http://localhost:%d/api/show%n", port);
@@ -133,9 +209,24 @@ public class ApiServer {
 
     // ── Undertow helpers ──────────────────────────────────────────────────────
 
-    /** Wrap a handler so it runs on the blocking worker thread pool. */
-    private static HttpHandler b(HttpHandler h) {
-        return new BlockingHandler(h);
+    /**
+     * Wrap a handler so it runs on {@link #requestExecutor} (virtual threads on
+     * Java 21+, platform threads otherwise) rather than on Undertow's IO thread.
+     * All handlers do blocking work (JNI, SSE writes), so they must all be wrapped.
+     */
+    private HttpHandler b(HttpHandler h) {
+        return exchange -> {
+            if (exchange.isInIoThread()) {
+                exchange.dispatch(requestExecutor, () -> {
+                    exchange.startBlocking();
+                    try { h.handleRequest(exchange); }
+                    catch (Exception e) { LOG.error("Handler error", e); }
+                });
+            } else {
+                exchange.startBlocking();
+                h.handleRequest(exchange);
+            }
+        };
     }
 
     /**
@@ -216,23 +307,28 @@ public class ApiServer {
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
-        try (LlamaContext ctx    = model.createContext(nCtx, nThreads);
-             LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
+        inferenceSemaphore.acquire();
+        try {
+            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
+                 LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
 
-            if (opts.stream) {
-                beginNdjson(ex);
-                try (OutputStream os = ex.getOutputStream()) {
-                    for (String piece : ts) writeNdjson(os, ollamaGenerateChunk(modelName, piece, false));
-                    writeNdjson(os, ollamaGenerateChunk(modelName, "", true));
+                if (opts.stream) {
+                    beginNdjson(ex);
+                    try (OutputStream os = ex.getOutputStream()) {
+                        for (String piece : ts) writeNdjson(os, ollamaGenerateChunk(modelName, piece, false));
+                        writeNdjson(os, ollamaGenerateChunk(modelName, "", true));
+                    }
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    for (String t : ts) sb.append(t);
+                    sendJson(ex, 200, ollamaGenerateChunk(modelName, sb.toString(), true));
                 }
-            } else {
-                StringBuilder sb = new StringBuilder();
-                for (String t : ts) sb.append(t);
-                sendJson(ex, 200, ollamaGenerateChunk(modelName, sb.toString(), true));
+            } catch (Exception e) {
+                LOG.error("generate failed for '{}'", modelName, e);
+                if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
             }
-        } catch (Exception e) {
-            LOG.error("generate failed for '{}'", modelName, e);
-            sendError(ex, 500, "generation failed: " + e.getMessage());
+        } finally {
+            inferenceSemaphore.release();
         }
     }
 
@@ -253,23 +349,28 @@ public class ApiServer {
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
-        try (LlamaContext ctx    = model.createContext(nCtx, nThreads);
-             LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
+        inferenceSemaphore.acquire();
+        try {
+            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
+                 LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
 
-            if (opts.stream) {
-                beginNdjson(ex);
-                try (OutputStream os = ex.getOutputStream()) {
-                    for (String piece : ts) writeNdjson(os, ollamaChatChunk(modelName, piece, false));
-                    writeNdjson(os, ollamaChatChunk(modelName, "", true));
+                if (opts.stream) {
+                    beginNdjson(ex);
+                    try (OutputStream os = ex.getOutputStream()) {
+                        for (String piece : ts) writeNdjson(os, ollamaChatChunk(modelName, piece, false));
+                        writeNdjson(os, ollamaChatChunk(modelName, "", true));
+                    }
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    for (String t : ts) sb.append(t);
+                    sendJson(ex, 200, ollamaChatChunk(modelName, sb.toString(), true));
                 }
-            } else {
-                StringBuilder sb = new StringBuilder();
-                for (String t : ts) sb.append(t);
-                sendJson(ex, 200, ollamaChatChunk(modelName, sb.toString(), true));
+            } catch (Exception e) {
+                LOG.error("chat failed for '{}'", modelName, e);
+                if (!ex.isResponseStarted()) sendError(ex, 500, "chat failed: " + e.getMessage());
             }
-        } catch (Exception e) {
-            LOG.error("chat failed for '{}'", modelName, e);
-            sendError(ex, 500, "chat failed: " + e.getMessage());
+        } finally {
+            inferenceSemaphore.release();
         }
     }
 
@@ -306,27 +407,31 @@ public class ApiServer {
         String id    = "chatcmpl-" + shortUuid();
         long created = Instant.now().getEpochSecond();
 
-        try (LlamaContext ctx    = model.createContext(nCtx, nThreads);
-             LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
+        inferenceSemaphore.acquire();
+        try {
+            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
+                 LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
 
-            if (opts.stream) {
-                beginSse(ex);
-                try (OutputStream os = ex.getOutputStream()) {
-                    // First chunk carries the role header
-                    writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
-                    for (String piece : ts) writeSse(os, openAiChatChunk(id, modelName, created, piece, null, null));
-                    writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
-                    os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                    os.flush();
+                if (opts.stream) {
+                    beginSse(ex);
+                    try (OutputStream os = ex.getOutputStream()) {
+                        writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
+                        for (String piece : ts) writeSse(os, openAiChatChunk(id, modelName, created, piece, null, null));
+                        writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
+                        os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                        os.flush();
+                    }
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    for (String t : ts) sb.append(t);
+                    sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
                 }
-            } else {
-                StringBuilder sb = new StringBuilder();
-                for (String t : ts) sb.append(t);
-                sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
+            } catch (Exception e) {
+                LOG.error("v1/chat/completions failed for '{}'", modelName, e);
+                if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
             }
-        } catch (Exception e) {
-            LOG.error("v1/chat/completions failed for '{}'", modelName, e);
-            sendError(ex, 500, "generation failed: " + e.getMessage());
+        } finally {
+            inferenceSemaphore.release();
         }
     }
 
@@ -348,25 +453,30 @@ public class ApiServer {
         String id    = "cmpl-" + shortUuid();
         long created = Instant.now().getEpochSecond();
 
-        try (LlamaContext ctx    = model.createContext(nCtx, nThreads);
-             LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
+        inferenceSemaphore.acquire();
+        try {
+            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
+                 LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
 
-            if (opts.stream) {
-                beginSse(ex);
-                try (OutputStream os = ex.getOutputStream()) {
-                    for (String piece : ts) writeSse(os, openAiCompletionChunk(id, modelName, created, piece, null));
-                    writeSse(os, openAiCompletionChunk(id, modelName, created, "", "stop"));
-                    os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                    os.flush();
+                if (opts.stream) {
+                    beginSse(ex);
+                    try (OutputStream os = ex.getOutputStream()) {
+                        for (String piece : ts) writeSse(os, openAiCompletionChunk(id, modelName, created, piece, null));
+                        writeSse(os, openAiCompletionChunk(id, modelName, created, "", "stop"));
+                        os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                        os.flush();
+                    }
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    for (String t : ts) sb.append(t);
+                    sendJson(ex, 200, openAiCompletionResponse(id, modelName, created, sb.toString()));
                 }
-            } else {
-                StringBuilder sb = new StringBuilder();
-                for (String t : ts) sb.append(t);
-                sendJson(ex, 200, openAiCompletionResponse(id, modelName, created, sb.toString()));
+            } catch (Exception e) {
+                LOG.error("v1/completions failed for '{}'", modelName, e);
+                if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
             }
-        } catch (Exception e) {
-            LOG.error("v1/completions failed for '{}'", modelName, e);
-            sendError(ex, 500, "generation failed: " + e.getMessage());
+        } finally {
+            inferenceSemaphore.release();
         }
     }
 

@@ -249,13 +249,16 @@ public class Main {
 
     private static void cmdServe(String[] args) throws Exception {
         int port = 11434;
+        int maxConcurrent = Runtime.getRuntime().availableProcessors();
         for (int i = 1; i < args.length; i++) {
             if ("--port".equals(args[i]) && i + 1 < args.length) {
                 port = Integer.parseInt(args[++i]);
+            } else if ("--max-concurrent".equals(args[i]) && i + 1 < args.length) {
+                maxConcurrent = Integer.parseInt(args[++i]);
             }
         }
         System.out.println("Starting local-llm server on http://localhost:" + port);
-        new ApiServer(port, registry, plugins).start();
+        new ApiServer(port, registry, plugins, maxConcurrent).start();
     }
 
     /**
@@ -451,6 +454,7 @@ public class Main {
         System.out.println("  rm <name> [--purge]                     Remove a model (--purge also deletes the file)");
         System.out.println("  run <name>                              Start an interactive chat session");
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
+        System.out.println("        [--max-concurrent <n>]            Max parallel inference slots (default: CPU count)");
         System.out.println("  show <name> [--yaml]                    Show model config (--yaml for Jllmfile format)");
         System.out.println("  info <name>                             Show model details");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");
