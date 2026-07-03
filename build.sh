@@ -38,6 +38,22 @@ JBOSS_THREADS_VERSION="3.5.0.Final"
 JBOSS_THREADS_JAR="lib/jboss-threads-${JBOSS_THREADS_VERSION}.jar"
 JBOSS_THREADS_URL="https://repo1.maven.org/maven2/org/jboss/threads/jboss-threads/${JBOSS_THREADS_VERSION}/jboss-threads-${JBOSS_THREADS_VERSION}.jar"
 
+LUCENE_VERSION="9.11.1"
+LUCENE_CORE_JAR="lib/lucene-core-${LUCENE_VERSION}.jar"
+LUCENE_CORE_URL="https://repo1.maven.org/maven2/org/apache/lucene/lucene-core/${LUCENE_VERSION}/lucene-core-${LUCENE_VERSION}.jar"
+LUCENE_ANALYSIS_JAR="lib/lucene-analysis-common-${LUCENE_VERSION}.jar"
+LUCENE_ANALYSIS_URL="https://repo1.maven.org/maven2/org/apache/lucene/lucene-analysis-common/${LUCENE_VERSION}/lucene-analysis-common-${LUCENE_VERSION}.jar"
+LUCENE_QUERYPARSER_JAR="lib/lucene-queryparser-${LUCENE_VERSION}.jar"
+LUCENE_QUERYPARSER_URL="https://repo1.maven.org/maven2/org/apache/lucene/lucene-queryparser/${LUCENE_VERSION}/lucene-queryparser-${LUCENE_VERSION}.jar"
+
+PDFBOX_VERSION="3.0.3"
+PDFBOX_JAR="lib/pdfbox-${PDFBOX_VERSION}.jar"
+PDFBOX_URL="https://repo1.maven.org/maven2/org/apache/pdfbox/pdfbox/${PDFBOX_VERSION}/pdfbox-${PDFBOX_VERSION}.jar"
+FONTBOX_JAR="lib/fontbox-${PDFBOX_VERSION}.jar"
+FONTBOX_URL="https://repo1.maven.org/maven2/org/apache/pdfbox/fontbox/${PDFBOX_VERSION}/fontbox-${PDFBOX_VERSION}.jar"
+PDFBOX_IO_JAR="lib/pdfbox-io-${PDFBOX_VERSION}.jar"
+PDFBOX_IO_URL="https://repo1.maven.org/maven2/org/apache/pdfbox/pdfbox-io/${PDFBOX_VERSION}/pdfbox-io-${PDFBOX_VERSION}.jar"
+
 OUT_JAR="target/local-llm.jar"
 
 echo "=== local-llm build ==="
@@ -61,10 +77,18 @@ download_if_missing "$XNIO_API_JAR"       "$XNIO_API_URL"
 download_if_missing "$XNIO_NIO_JAR"       "$XNIO_NIO_URL"
 download_if_missing "$JBOSS_LOGGING_JAR"  "$JBOSS_LOGGING_URL"
 download_if_missing "$WILDFLY_COMMON_JAR" "$WILDFLY_COMMON_URL"
-download_if_missing "$JBOSS_THREADS_JAR" "$JBOSS_THREADS_URL"
+download_if_missing "$JBOSS_THREADS_JAR"    "$JBOSS_THREADS_URL"
+download_if_missing "$LUCENE_CORE_JAR"     "$LUCENE_CORE_URL"
+download_if_missing "$LUCENE_ANALYSIS_JAR" "$LUCENE_ANALYSIS_URL"
+download_if_missing "$LUCENE_QUERYPARSER_JAR" "$LUCENE_QUERYPARSER_URL"
+download_if_missing "$PDFBOX_JAR"          "$PDFBOX_URL"
+download_if_missing "$FONTBOX_JAR"         "$FONTBOX_URL"
+download_if_missing "$PDFBOX_IO_JAR"       "$PDFBOX_IO_URL"
 
 CP="$GSON_JAR:$SLF4J_JAR:$LOGBACK_CLASSIC_JAR:$LOGBACK_CORE_JAR:\
-$UNDERTOW_JAR:$XNIO_API_JAR:$XNIO_NIO_JAR:$JBOSS_LOGGING_JAR:$WILDFLY_COMMON_JAR:$JBOSS_THREADS_JAR"
+$UNDERTOW_JAR:$XNIO_API_JAR:$XNIO_NIO_JAR:$JBOSS_LOGGING_JAR:$WILDFLY_COMMON_JAR:$JBOSS_THREADS_JAR:\
+$LUCENE_CORE_JAR:$LUCENE_ANALYSIS_JAR:$LUCENE_QUERYPARSER_JAR:\
+$PDFBOX_JAR:$FONTBOX_JAR:$PDFBOX_IO_JAR"
 
 echo "Compiling..."
 find src/main/java -name "*.java" | sort > /tmp/local_llm_sources.txt
@@ -102,6 +126,14 @@ jar xf "../../$XNIO_NIO_JAR"
 jar xf "../../$JBOSS_LOGGING_JAR"
 jar xf "../../$WILDFLY_COMMON_JAR"
 jar xf "../../$JBOSS_THREADS_JAR"
+jar xf "../../$LUCENE_CORE_JAR"
+jar xf "../../$LUCENE_ANALYSIS_JAR"
+jar xf "../../$LUCENE_QUERYPARSER_JAR"
+jar xf "../../$PDFBOX_JAR"
+jar xf "../../$FONTBOX_JAR"
+jar xf "../../$PDFBOX_IO_JAR"
+# Remove module-info.class files from Java 9+ module JARs to avoid conflicts in the fat JAR.
+find . -name "module-info.class" -delete 2>/dev/null || true
 # Keep META-INF/services (SLF4J binding discovery relies on it) but drop
 # the rest (per-jar manifests, module info, license files, ...) so they
 # don't collide when multiple dependency JARs are merged into one.

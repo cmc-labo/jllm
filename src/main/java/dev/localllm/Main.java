@@ -7,6 +7,8 @@ import dev.localllm.model.ModelRegistry;
 import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
 import dev.localllm.plugin.PromptInterceptor;
+import dev.localllm.rag.RagManager;
+import dev.localllm.rag.RagResult;
 import dev.localllm.runner.ModelRunner;
 import dev.localllm.server.ApiServer;
 
@@ -20,7 +22,8 @@ import java.util.Locale;
 
 public class Main {
 
-    private static final ModelRegistry registry = new ModelRegistry();
+    private static final ModelRegistry registry   = new ModelRegistry();
+    private static final RagManager    ragManager = new RagManager(ModelRegistry.getRagDir());
 
     // Loaded once at startup; shared across commands.
     private static final PluginManager plugins;
@@ -46,6 +49,7 @@ public class Main {
             case "remove":  cmdRemove(args);    break;
             case "run":     cmdRun(args);       break;
             case "serve":   cmdServe(args);     break;
+            case "rag":     cmdRag(args);       break;
             case "show":    cmdShow(args);      break;
             case "info":    cmdInfo(args);      break;
             case "storage": cmdStorage();       break;
@@ -238,13 +242,17 @@ public class Main {
     }
 
     private static void cmdRun(String[] args) throws Exception {
-        if (args.length < 2) { System.err.println("Usage: local-llm run <name>"); System.exit(1); }
+        if (args.length < 2) { System.err.println("Usage: jllm run <name> [--rag <collection>]"); System.exit(1); }
+        String ragCollection = null;
+        for (int i = 2; i < args.length; i++) {
+            if ("--rag".equals(args[i]) && i + 1 < args.length) ragCollection = args[++i];
+        }
         ModelConfig model = registry.get(args[1]).orElse(null);
         if (model == null) {
             System.err.println("Model '" + args[1] + "' not found. Run 'list' to see available models.");
             System.exit(1);
         }
-        new ModelRunner(plugins).runInteractive(model);
+        new ModelRunner(plugins, ragManager, ragCollection).runInteractive(model);
     }
 
     private static void cmdServe(String[] args) throws Exception {
@@ -258,7 +266,7 @@ public class Main {
             }
         }
         System.out.println("Starting local-llm server on http://localhost:" + port);
-        new ApiServer(port, registry, plugins, maxConcurrent).start();
+        new ApiServer(port, registry, plugins, ragManager, maxConcurrent).start();
     }
 
     /**
@@ -388,6 +396,104 @@ public class Main {
         }
     }
 
+    // ── rag ───────────────────────────────────────────────────────────────────
+
+    private static void cmdRag(String[] args) throws Exception {
+        if (args.length < 2) { printRagUsage(); return; }
+        switch (args[1]) {
+            case "add":    cmdRagAdd(args);    break;
+            case "list":   cmdRagList();       break;
+            case "search": cmdRagSearch(args); break;
+            case "rm":     cmdRagRm(args);     break;
+            default:
+                System.err.println("Unknown rag subcommand: " + args[1]);
+                printRagUsage();
+                System.exit(1);
+        }
+    }
+
+    private static void cmdRagAdd(String[] args) throws Exception {
+        if (args.length < 4) {
+            System.err.println("Usage: jllm rag add <collection> <path>");
+            System.exit(1);
+        }
+        String collection = args[2];
+        Path   path       = Paths.get(args[3]);
+        if (!Files.exists(path)) {
+            System.err.println("Path not found: " + path);
+            System.exit(1);
+        }
+        System.out.println("Indexing into collection '" + collection + "'...");
+        ragManager.addDocuments(collection, path, System.out::println);
+        System.out.println("Done.");
+        System.out.println("Use: jllm run <model> --rag " + collection);
+    }
+
+    private static void cmdRagList() throws Exception {
+        List<RagManager.CollectionInfo> collections = ragManager.listCollections();
+        if (collections.isEmpty()) {
+            System.out.println("No RAG collections found.");
+            System.out.println("Create one with: jllm rag add <collection> <path>");
+            return;
+        }
+        System.out.printf("%-25s  %8s  %s%n", "COLLECTION", "CHUNKS", "PATH");
+        System.out.println("-".repeat(75));
+        for (RagManager.CollectionInfo c : collections) {
+            System.out.printf("%-25s  %8d  %s%n", c.name, c.chunkCount, c.path);
+        }
+    }
+
+    private static void cmdRagSearch(String[] args) throws Exception {
+        if (args.length < 4) {
+            System.err.println("Usage: jllm rag search <collection> <query>");
+            System.exit(1);
+        }
+        String collection = args[2];
+        String query = String.join(" ", java.util.Arrays.copyOfRange(args, 3, args.length));
+        System.out.println("Searching '" + collection + "' for: " + query);
+        System.out.println();
+        List<RagResult> hits = ragManager.search(collection, query);
+        if (hits.isEmpty()) {
+            System.out.println("No results found.");
+            return;
+        }
+        for (int i = 0; i < hits.size(); i++) {
+            RagResult r = hits.get(i);
+            String fileName = Paths.get(r.source).getFileName().toString();
+            System.out.printf("[%d] %s", i + 1, fileName);
+            if (r.page > 0) System.out.printf(" (page %d)", r.page);
+            System.out.printf("  score=%.3f%n", r.score);
+            System.out.println("    " + r.content.replaceAll("\\s+", " ")
+                    .substring(0, Math.min(200, r.content.length())) + "...");
+            System.out.println();
+        }
+    }
+
+    private static void cmdRagRm(String[] args) throws Exception {
+        if (args.length < 3) {
+            System.err.println("Usage: jllm rag rm <collection>");
+            System.exit(1);
+        }
+        String collection = args[2];
+        ragManager.deleteCollection(collection);
+        System.out.println("Deleted collection '" + collection + "'.");
+    }
+
+    private static void printRagUsage() {
+        System.out.println("Usage: jllm rag <subcommand> [options]");
+        System.out.println();
+        System.out.println("Subcommands:");
+        System.out.println("  add <collection> <path>      Index a file or directory into a collection");
+        System.out.println("  list                         List all indexed collections");
+        System.out.println("  search <collection> <query>  Test retrieval (debug)");
+        System.out.println("  rm <collection>              Delete a collection and its index");
+        System.out.println();
+        System.out.println("Then use a collection in a chat session:");
+        System.out.println("  jllm run <model> --rag <collection>");
+        System.out.println("Or via API (include in request body):");
+        System.out.println("  { \"rag_collection\": \"<collection>\", ... }");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private static void printModelfileParams(ModelConfig m) {
@@ -452,9 +558,13 @@ public class Main {
         System.out.println("  create <name> -f <file>                 Create a model from a Modelfile or Jllmfile (.yaml/.yml)");
         System.out.println("                [--binary <path>]         Path to llama.cpp binary");
         System.out.println("  rm <name> [--purge]                     Remove a model (--purge also deletes the file)");
-        System.out.println("  run <name>                              Start an interactive chat session");
+        System.out.println("  run <name> [--rag <collection>]         Start an interactive chat session");
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
         System.out.println("        [--max-concurrent <n>]            Max parallel inference slots (default: CPU count)");
+        System.out.println("  rag add <collection> <path>             Index a file or directory for RAG");
+        System.out.println("  rag list                                List RAG collections");
+        System.out.println("  rag search <collection> <query>         Test RAG retrieval");
+        System.out.println("  rag rm <collection>                     Delete a RAG collection");
         System.out.println("  show <name> [--yaml]                    Show model config (--yaml for Jllmfile format)");
         System.out.println("  info <name>                             Show model details");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");

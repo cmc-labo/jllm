@@ -9,6 +9,8 @@ import dev.localllm.jni.LlamaModel;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
+import dev.localllm.rag.RagManager;
+import dev.localllm.rag.RagResult;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
@@ -56,13 +58,21 @@ public class ModelRunner {
     private static final Gson GSON = new Gson();
 
     private final PluginManager plugins;
+    private final RagManager    ragManager;
+    private final String        ragCollection;
 
     public ModelRunner() {
-        this(PluginManager.EMPTY);
+        this(PluginManager.EMPTY, null, null);
     }
 
     public ModelRunner(PluginManager plugins) {
-        this.plugins = plugins != null ? plugins : PluginManager.EMPTY;
+        this(plugins, null, null);
+    }
+
+    public ModelRunner(PluginManager plugins, RagManager ragManager, String ragCollection) {
+        this.plugins       = plugins != null ? plugins : PluginManager.EMPTY;
+        this.ragManager    = ragManager;
+        this.ragCollection = ragCollection;
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -138,6 +148,10 @@ public class ModelRunner {
         if (plugins.hasInterceptors()) {
             System.out.printf("Intercept: %d loaded%n", plugins.getInterceptors().size());
         }
+        if (ragCollection != null) {
+            System.out.printf("RAG      : collection '%s' (top-%d chunks per turn)%n",
+                    ragCollection, RagManager.DEFAULT_TOP_K);
+        }
 
         List<String[]> history = new ArrayList<>(); // [role, content] pairs
 
@@ -174,13 +188,28 @@ public class ModelRunner {
                     // ── inner tool-call loop ───────────────────────────────
                     history.add(new String[]{"user", input});
 
+                    // RAG: search once per user turn and prepend context to system prompt.
+                    String turnSystem = effectiveSystem;
+                    if (ragManager != null && ragCollection != null) {
+                        try {
+                            List<RagResult> hits = ragManager.search(ragCollection, input);
+                            String ragCtx = RagManager.buildContextBlock(hits);
+                            if (ragCtx != null) {
+                                turnSystem = effectiveSystem != null && !effectiveSystem.isEmpty()
+                                        ? ragCtx + "\n\n" + effectiveSystem : ragCtx;
+                            }
+                        } catch (Exception e) {
+                            System.err.println("[RAG search error: " + e.getMessage() + "]");
+                        }
+                    }
+
                     for (int toolTurn = 0; toolTurn <= MAX_TOOL_TURNS; toolTurn++) {
                         if (toolTurn == MAX_TOOL_TURNS) {
                             System.out.println("[Reached max tool calls (" + MAX_TOOL_TURNS + ") — returning to prompt]");
                             break;
                         }
 
-                        String prompt = buildPrompt(history, effectiveSystem);
+                        String prompt = buildPrompt(history, turnSystem);
                         prompt = plugins.applyInterceptors(prompt);
 
                         System.out.print("\nAssistant> ");

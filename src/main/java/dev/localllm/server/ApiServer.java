@@ -10,6 +10,8 @@ import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
 import dev.localllm.plugin.PluginManager;
+import dev.localllm.rag.RagManager;
+import dev.localllm.rag.RagResult;
 import io.undertow.Handlers;
 import io.undertow.Undertow;
 import io.undertow.server.HttpHandler;
@@ -22,6 +24,7 @@ import org.slf4j.LoggerFactory;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -89,6 +92,7 @@ public class ApiServer {
     private final int port;
     private final ModelRegistry registry;
     private final PluginManager plugins;
+    private final RagManager ragManager;
     private final int maxConcurrent;
 
     // Each HTTP request runs on its own virtual thread (Java 21+) or daemon
@@ -105,22 +109,28 @@ public class ApiServer {
     private final Gson compactGson;
 
     public ApiServer(int port, ModelRegistry registry) {
-        this(port, registry, PluginManager.EMPTY, DEFAULT_MAX_CONCURRENT);
+        this(port, registry, PluginManager.EMPTY, null, DEFAULT_MAX_CONCURRENT);
     }
 
     public ApiServer(int port, ModelRegistry registry, PluginManager plugins) {
-        this(port, registry, plugins, DEFAULT_MAX_CONCURRENT);
+        this(port, registry, plugins, null, DEFAULT_MAX_CONCURRENT);
     }
 
     public ApiServer(int port, ModelRegistry registry, PluginManager plugins, int maxConcurrent) {
-        this.port              = port;
-        this.registry          = registry;
-        this.plugins           = plugins != null ? plugins : PluginManager.EMPTY;
-        this.maxConcurrent     = maxConcurrent;
-        this.requestExecutor   = createExecutor();
+        this(port, registry, plugins, null, maxConcurrent);
+    }
+
+    public ApiServer(int port, ModelRegistry registry, PluginManager plugins,
+                     RagManager ragManager, int maxConcurrent) {
+        this.port               = port;
+        this.registry           = registry;
+        this.plugins            = plugins != null ? plugins : PluginManager.EMPTY;
+        this.ragManager         = ragManager;
+        this.maxConcurrent      = maxConcurrent;
+        this.requestExecutor    = createExecutor();
         this.inferenceSemaphore = new Semaphore(maxConcurrent);
-        this.prettyGson        = new GsonBuilder().setPrettyPrinting().create();
-        this.compactGson       = new Gson();
+        this.prettyGson         = new GsonBuilder().setPrettyPrinting().create();
+        this.compactGson        = new Gson();
     }
 
     // ── Virtual thread detection and executor creation ────────────────────────
@@ -303,7 +313,9 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(cfg.getSystemPrompt(), prompt));
+        String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
+        String effectiveSystem = ragEnhancedSystem(ragCollection, prompt, cfg.getSystemPrompt());
+        String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(effectiveSystem, prompt));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
@@ -345,7 +357,10 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, cfg.getSystemPrompt()));
+        String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
+        String ragQuery = lastUserMessage(messages);
+        String effectiveSystem = ragEnhancedSystem(ragCollection, ragQuery, cfg.getSystemPrompt());
+        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, effectiveSystem));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
@@ -401,7 +416,9 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, cfg.getSystemPrompt()));
+        String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
+        String effectiveSystem = ragEnhancedSystem(ragCollection, lastUserMessage(messages), cfg.getSystemPrompt());
+        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, effectiveSystem));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
         String id    = "chatcmpl-" + shortUuid();
@@ -447,7 +464,9 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
-        String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(cfg.getSystemPrompt(), prompt));
+        String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
+        String ragSystem = ragEnhancedSystem(ragCollection, prompt, cfg.getSystemPrompt());
+        String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(ragSystem, prompt));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
         String id    = "cmpl-" + shortUuid();
@@ -478,6 +497,38 @@ public class ApiServer {
         } finally {
             inferenceSemaphore.release();
         }
+    }
+
+    // ── RAG helpers ───────────────────────────────────────────────────────────
+
+    /**
+     * Search the named RAG collection for {@code query} and return a system prompt
+     * that prepends the retrieved context block in front of {@code baseSystem}.
+     * Returns {@code baseSystem} unchanged if RAG is not configured or finds nothing.
+     */
+    private String ragEnhancedSystem(String collection, String query, String baseSystem) {
+        if (ragManager == null || collection == null || collection.isEmpty()) return baseSystem;
+        try {
+            List<RagResult> hits = ragManager.search(collection, query);
+            String ctx = RagManager.buildContextBlock(hits);
+            if (ctx == null) return baseSystem;
+            return (baseSystem != null && !baseSystem.isEmpty())
+                ? ctx + "\n\n" + baseSystem : ctx;
+        } catch (Exception e) {
+            LOG.warn("RAG search failed for collection '{}': {}", collection, e.getMessage());
+            return baseSystem;
+        }
+    }
+
+    /** Extract the text of the last user-role message from a messages array. */
+    private static String lastUserMessage(JsonArray messages) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            JsonObject msg = messages.get(i).getAsJsonObject();
+            if ("user".equals(msg.get("role").getAsString())) {
+                return msg.get("content").getAsString();
+            }
+        }
+        return "";
     }
 
     // ── HTTP I/O helpers ──────────────────────────────────────────────────────

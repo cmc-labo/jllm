@@ -19,12 +19,16 @@ public class ModelRegistry {
     private static final Path REGISTRY_FILE = REGISTRY_DIR.resolve("models.json");
     private static final Path MANAGED_DIR   = REGISTRY_DIR.resolve("models");
     private static final Path PLUGINS_DIR   = REGISTRY_DIR.resolve("plugins");
+    private static final Path RAG_DIR       = REGISTRY_DIR.resolve("rag");
 
     /** Returns the directory where managed GGUF files are stored. */
     public static Path getManagedModelsDir() { return MANAGED_DIR; }
 
     /** Returns the directory where plugin JARs are stored. */
     public static Path getPluginsDir() { return PLUGINS_DIR; }
+
+    /** Returns the root directory for RAG Lucene indices (one subdirectory per collection). */
+    public static Path getRagDir() { return RAG_DIR; }
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final Type MODEL_LIST_TYPE = new TypeToken<List<ModelConfig>>() {}.getType();
 
