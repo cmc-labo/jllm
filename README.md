@@ -8,6 +8,8 @@ Both `run` (interactive chat) and `serve` (HTTP API server) run inference in-pro
 
 The tool is extensible: drop a JAR into `~/.local-llm/plugins/` to add new **function-calling tools** or **prompt interceptors** without rebuilding the application.
 
+RAG (Retrieval-Augmented Generation) is built in: index local PDFs and text files with `jllm rag add`, then pass `--rag <collection>` to `jllm run` or include `"rag_collection"` in any API request. Retrieval runs entirely on-device via an embedded [Apache Lucene](https://lucene.apache.org/) index — no embedding model, no external server, no network required.
+
 ## Requirements
 
 - Java 11+
@@ -58,8 +60,12 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `add <name> --path <path>` | Register a model by pointing to a GGUF file |
 | `create <name> -f <file>` | Create a model from a Modelfile or Jllmfile |
 | `rm <name> [--purge]` | Remove a model from the registry (optionally delete the file) |
-| `run <name>` | Start an interactive chat session with streaming output |
+| `run <name> [--rag <collection>]` | Start an interactive chat session with streaming output |
 | `serve [--port <port>] [--max-concurrent <n>]` | Start the HTTP API server (default port: 11434) |
+| `rag add <collection> <path>` | Index a file or directory into a RAG collection |
+| `rag list` | List all RAG collections with chunk counts |
+| `rag search <collection> <query>` | Test retrieval (shows top chunks and BM25 scores) |
+| `rag rm <collection>` | Delete a RAG collection and its index |
 | `show <name> [--yaml]` | Print the model's config (Modelfile or Jllmfile format) |
 | `info <name>` | Show model details |
 | `plugins` | List all loaded plugin tools and interceptors |
@@ -121,6 +127,149 @@ jllm serve --max-concurrent 4
 | `--max-concurrent <n>` | Maximum number of inference calls that run simultaneously (default: CPU core count). Extra requests wait until a slot is free. |
 
 On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project Loom) — created instantly, with no OS thread per connection. Requests blocked on the semaphore waiting for an inference slot unmount their virtual thread so no OS thread is wasted. On **Java 11–20**, a cached platform thread pool is used instead; the semaphore still applies.
+
+---
+
+## RAG — local document search (`jllm rag`)
+
+RAG lets the model answer questions about your own files without sending anything outside the machine.  
+Documents are indexed once into a named **collection**; at chat time jllm retrieves the most relevant passages and injects them into the model's context automatically.
+
+Supported file types: **PDF** (text extracted page-by-page via PDFBox), plus any plain-text format (`.txt`, `.md`, `.java`, `.py`, `.json`, `.yaml`, `.html`, `.csv`, `.sql`, …).
+
+### How it works
+
+1. **Index** — jllm reads each file, splits it into ~400-word chunks with 50-word overlap, and stores them in a [Lucene](https://lucene.apache.org/) BM25 full-text index at `~/.local-llm/rag/<collection>/`.
+2. **Retrieve** — at the start of each chat turn (or each API request), jllm queries the index with the user's message and retrieves the top-5 most relevant chunks.
+3. **Generate** — the retrieved chunks are prepended to the model's system prompt as a `[Context from local documents]` block. The model uses them to answer and cites the source file (and page number for PDFs).
+
+No embedding model is needed — BM25 is fast, accurate for keyword-rich queries, and requires zero configuration.
+
+### `jllm rag add` — Index documents
+
+```bash
+# Index a single PDF
+jllm rag add my-docs ~/papers/attention-is-all-you-need.pdf
+
+# Index an entire directory (recursively; unsupported files are skipped)
+jllm rag add my-docs ~/documents/
+
+# Build multiple collections for different topics
+jllm rag add api-specs    ~/work/specs/
+jllm rag add legal-docs   ~/contracts/
+```
+
+Re-indexing a file that was already indexed is safe — the old chunks are replaced automatically, so `rag add` is idempotent.
+
+### `jllm rag list` — List collections
+
+```bash
+jllm rag list
+```
+
+```
+COLLECTION                  CHUNKS  PATH
+---------------------------------------------------------------------------
+api-specs                      248  /home/user/.local-llm/rag/api-specs
+legal-docs                      91  /home/user/.local-llm/rag/legal-docs
+my-docs                         57  /home/user/.local-llm/rag/my-docs
+```
+
+### `jllm rag search` — Test retrieval
+
+Debug which chunks would be injected for a given query, without running the model:
+
+```bash
+jllm rag search my-docs "transformer attention mechanism"
+```
+
+```
+[1] attention-is-all-you-need.pdf (page 3)  score=4.821
+    Scaled Dot-Product Attention We call our particular attention "Scaled Dot-Product Attention"...
+
+[2] attention-is-all-you-need.pdf (page 4)  score=3.104
+    Multi-Head Attention Instead of performing a single attention function with d_model-dimensional...
+```
+
+### `jllm rag rm` — Delete a collection
+
+```bash
+jllm rag rm my-docs
+# → Deleted collection 'my-docs'.
+```
+
+### Using RAG in an interactive session
+
+Pass `--rag <collection>` to `jllm run`:
+
+```bash
+jllm run phi3:mini --rag my-docs
+```
+
+```
+Model    : phi3:mini
+Settings : temperature=0.80  max_tokens=512  context=4096
+RAG      : collection 'my-docs' (top-5 chunks per turn)
+Commands : /clear  /help  /quit
+------------------------------------------------------------
+
+You> What does the paper say about multi-head attention?
+
+Assistant> According to the paper (page 4), multi-head attention runs h attention
+functions in parallel on projected versions of the queries, keys, and values.
+Each "head" focuses on different positional subspaces, and the results are
+concatenated and projected back to the full dimension...
+```
+
+RAG context is retrieved fresh on every turn so the model always uses the most relevant passages for each question. `/clear` resets the conversation history but does not affect the index.
+
+### Using RAG via the HTTP API
+
+Include `"rag_collection"` in any request body. The last `user`-role message is used as the retrieval query:
+
+```bash
+# Ollama-compatible endpoint
+curl http://localhost:11434/api/chat \
+  -d '{
+    "model": "phi3:mini",
+    "messages": [{"role":"user","content":"What is the conclusion of the report?"}],
+    "rag_collection": "my-docs"
+  }'
+
+# OpenAI-compatible endpoint
+curl http://localhost:11434/v1/chat/completions \
+  -d '{
+    "model": "phi3:mini",
+    "messages": [{"role":"user","content":"Summarise section 3."}],
+    "rag_collection": "legal-docs",
+    "stream": true
+  }'
+
+# Plain text generation (/api/generate, /v1/completions) — prompt used as query
+curl http://localhost:11434/api/generate \
+  -d '{
+    "model": "phi3:mini",
+    "prompt": "Explain the attention formula from the paper.",
+    "rag_collection": "my-docs"
+  }'
+```
+
+Each API request can reference a different collection; collections are shared across concurrent requests.
+
+### Storage layout (RAG)
+
+```
+~/.local-llm/rag/
+├── my-docs/          # Lucene index — one directory per collection
+│   ├── segments_N
+│   ├── _0.cfe
+│   ├── _0.cfs
+│   └── write.lock
+└── legal-docs/
+    └── ...
+```
+
+Lucene index files are managed entirely by jllm. Do not edit them by hand.
 
 ---
 
@@ -449,6 +598,10 @@ jllm info phi3:mini
 # Interactive streaming chat
 jllm run phi3:mini
 
+# Interactive chat with RAG over a document collection
+jllm rag add my-docs ~/documents/
+jllm run phi3:mini --rag my-docs
+
 # Start API server on the default port (11434)
 jllm serve
 
@@ -703,10 +856,16 @@ local-llm-env/
     │   ├── LlmTool.java                  # SPI: function-calling tool interface
     │   ├── PromptInterceptor.java        # SPI: prompt transformation interface
     │   └── PluginManager.java            # JAR scanner, URLClassLoader, interceptor chain
+    ├── rag/
+    │   ├── RagResult.java                # Search result POJO (source, page, chunk, BM25 score)
+    │   ├── DocumentChunker.java          # Split text into overlapping word-level chunks
+    │   ├── DocumentReader.java           # Read PDF (PDFBox) and plain-text files
+    │   ├── RagIndex.java                 # Lucene FSDirectory wrapper (search + stats)
+    │   └── RagManager.java               # Collection management, indexing, context block builder
     ├── runner/
-    │   └── ModelRunner.java              # Interactive REPL: JNI streaming + tool calling loop
+    │   └── ModelRunner.java              # Interactive REPL: JNI streaming + tool calling loop + RAG
     ├── server/
-    │   └── ApiServer.java                # Undertow HTTP server: Ollama + OpenAI APIs
+    │   └── ApiServer.java                # Undertow HTTP server: Ollama + OpenAI APIs + RAG
     └── jni/
         ├── LlamaNative.java              # Raw native method declarations
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
@@ -725,9 +884,12 @@ local-llm-env/
 ├── models/              # Managed storage (populated by jllm add --managed)
 │   ├── phi3-mini.gguf
 │   └── llama3-8b.gguf
-└── plugins/             # Plugin JARs (drop-in; loaded at startup)
-    ├── weather-1.0.jar
-    └── logging-plugin.jar
+├── plugins/             # Plugin JARs (drop-in; loaded at startup)
+│   ├── weather-1.0.jar
+│   └── logging-plugin.jar
+└── rag/                 # RAG Lucene indices (one subdirectory per collection)
+    ├── my-docs/         # jllm rag add my-docs ~/documents/
+    └── api-specs/       # jllm rag add api-specs ~/work/specs/
 ```
 
 ---
@@ -740,6 +902,8 @@ local-llm-env/
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md). A model's `SYSTEM` prompt is injected as a `system` turn at the start of every chat — unless the request already includes a `system` role message, in which case the request takes precedence.
 - Logging goes through SLF4J ([Logback](https://logback.qos.ch/) by default, see `src/main/resources/logback.xml`); this includes llama.cpp/ggml's own native log output (see [Native log output](#native-log-output) below). In interactive REPL mode, native INFO logs are suppressed after the model and context load — they only appear at startup.
 - Plugin JARs are each loaded in an isolated `URLClassLoader` (child of the application classloader), so multiple plugins with conflicting class names coexist safely.
+- RAG retrieval uses [Apache Lucene](https://lucene.apache.org/) BM25 (the same ranking algorithm used by Elasticsearch and OpenSearch). No embedding model or vector database is required. PDF text extraction is handled by [Apache PDFBox](https://pdfbox.apache.org/). Both libraries are bundled in the fat JAR — no extra setup needed.
+- The RAG index is persistent: you index once and reuse across many sessions. Re-indexing a file replaces its previous chunks so the operation is always safe to repeat.
 
 ---
 
