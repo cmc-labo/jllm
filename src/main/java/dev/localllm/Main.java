@@ -242,17 +242,80 @@ public class Main {
     }
 
     private static void cmdRun(String[] args) throws Exception {
-        if (args.length < 2) { System.err.println("Usage: jllm run <name> [--rag <collection>]"); System.exit(1); }
-        String ragCollection = null;
-        for (int i = 2; i < args.length; i++) {
-            if ("--rag".equals(args[i]) && i + 1 < args.length) ragCollection = args[++i];
+        if (args.length < 2) {
+            System.err.println("Usage: jllm run <name> [--rag <collection>] [--system <prompt>]");
+            System.err.println("                      [--temperature <float>] [--max-tokens <int>]");
+            System.err.println("                      [--ctx <int>] [--threads <int>] [--no-system]");
+            System.exit(1);
         }
+
+        String  ragCollection       = null;
+        String  overrideSystem      = null;
+        boolean clearSystem         = false;
+        Float   overrideTemperature = null;
+        Integer overrideMaxTokens   = null;
+        Integer overrideCtx         = null;
+        Integer overrideThreads     = null;
+
+        for (int i = 2; i < args.length; i++) {
+            switch (args[i]) {
+                case "--rag":
+                    if (i + 1 < args.length) ragCollection = args[++i]; break;
+                case "--system":
+                    if (i + 1 < args.length) overrideSystem = args[++i]; break;
+                case "--no-system":
+                    clearSystem = true; break;
+                case "--temperature":
+                    if (i + 1 < args.length) overrideTemperature = Float.parseFloat(args[++i]); break;
+                case "--max-tokens":
+                case "--num-predict":
+                    if (i + 1 < args.length) overrideMaxTokens = Integer.parseInt(args[++i]); break;
+                case "--ctx":
+                case "--num-ctx":
+                    if (i + 1 < args.length) overrideCtx = Integer.parseInt(args[++i]); break;
+                case "--threads":
+                case "--num-threads":
+                    if (i + 1 < args.length) overrideThreads = Integer.parseInt(args[++i]); break;
+                default:
+                    System.err.println("Unknown flag: " + args[i]);
+                    System.exit(1);
+            }
+        }
+
         ModelConfig model = registry.get(args[1]).orElse(null);
         if (model == null) {
             System.err.println("Model '" + args[1] + "' not found. Run 'list' to see available models.");
             System.exit(1);
         }
+
+        // Apply session-level overrides to a shallow copy — registry entry is never modified.
+        model = applyRunOverrides(model, overrideTemperature, overrideMaxTokens,
+                                  overrideCtx, overrideThreads, overrideSystem, clearSystem);
+
         new ModelRunner(plugins, ragManager, ragCollection).runInteractive(model);
+    }
+
+    /**
+     * Return a copy of {@code src} with per-session overrides applied.
+     * A {@code null} override means "keep the value from the registered config".
+     * {@code clearSystem=true} wipes the system prompt regardless of {@code system}.
+     */
+    private static ModelConfig applyRunOverrides(ModelConfig src,
+            Float temperature, Integer maxTokens, Integer ctx, Integer threads,
+            String system, boolean clearSystem) {
+        ModelConfig c = new ModelConfig();
+        c.setName(src.getName());
+        c.setPath(src.getPath());
+        c.setBinary(src.getBinary());
+        c.setFormat(src.getFormat());
+        c.setSizeBytes(src.getSizeBytes());
+        c.setAddedAt(src.getAddedAt());
+        c.setTemperature(temperature  != null ? temperature  : src.getTemperature());
+        c.setNumPredict(maxTokens     != null ? maxTokens    : src.getNumPredict());
+        c.setNumCtx(ctx               != null ? ctx          : src.getNumCtx());
+        c.setNumThreads(threads       != null ? threads      : src.getNumThreads());
+        c.setSystemPrompt(clearSystem ? "" : (system != null ? system : src.getSystemPrompt()));
+        return c;
     }
 
     private static void cmdServe(String[] args) throws Exception {
@@ -559,6 +622,12 @@ public class Main {
         System.out.println("                [--binary <path>]         Path to llama.cpp binary");
         System.out.println("  rm <name> [--purge]                     Remove a model (--purge also deletes the file)");
         System.out.println("  run <name> [--rag <collection>]         Start an interactive chat session");
+        System.out.println("             [--system <prompt>]          Override system prompt for this session");
+        System.out.println("             [--no-system]                Clear system prompt for this session");
+        System.out.println("             [--temperature <float>]      Override temperature (e.g. 0.2)");
+        System.out.println("             [--max-tokens <int>]         Override max output tokens");
+        System.out.println("             [--ctx <int>]                Override context window size");
+        System.out.println("             [--threads <int>]            Override CPU thread count");
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
         System.out.println("        [--max-concurrent <n>]            Max parallel inference slots (default: CPU count)");
         System.out.println("  rag add <collection> <path>             Index a file or directory for RAG");
