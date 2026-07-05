@@ -14,8 +14,11 @@ import dev.localllm.rag.RagResult;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -94,6 +97,29 @@ public class ModelRunner {
             System.out.println("Note: JNI native library not available — falling back to llama-cli subprocess.");
             System.out.println();
             runInteractiveSubprocess(model);
+        }
+    }
+
+    /**
+     * Non-interactive one-shot generation: generate a response for {@code prompt},
+     * stream it to stdout, then exit. No banner, no prefixes — designed for piped
+     * use in scripts.
+     *
+     * <p>RAG retrieval and prompt interceptors are applied exactly as in the
+     * interactive REPL. Tool calling is not performed (the output is the raw
+     * model response).
+     */
+    public void runOnce(ModelConfig model, String prompt) throws Exception {
+        try {
+            runOnceJni(model, prompt);
+        } catch (UnsatisfiedLinkError e) {
+            if (model.getBinary() == null) {
+                throw new RuntimeException(
+                    "JNI native library not found and no llama-cli binary configured for '"
+                    + model.getName() + "'.\n"
+                    + "Build the native library (see README) or re-register with --binary <path>.");
+            }
+            runOnceSubprocess(model, prompt);
         }
     }
 
@@ -240,6 +266,74 @@ public class ModelRunner {
                 ctx.close();
             }
         }
+    }
+
+    // ── Non-interactive (one-shot) ────────────────────────────────────────────
+
+    private void runOnceJni(ModelConfig model, String prompt) throws Exception {
+        int   nCtx        = model.getNumCtx()      != null ? model.getNumCtx()      : DEFAULT_N_CTX;
+        int   nThreads    = model.getNumThreads()  != null ? model.getNumThreads()  : DEFAULT_N_THREADS;
+        float temperature = model.getTemperature() != null ? model.getTemperature() : DEFAULT_TEMPERATURE;
+        int   numPredict  = model.getNumPredict()  != null ? model.getNumPredict()  : DEFAULT_NUM_PREDICT;
+
+        // Build effective system prompt: RAG context first, then model system prompt.
+        String effectiveSystem = model.getSystemPrompt();
+        if (ragManager != null && ragCollection != null) {
+            try {
+                List<RagResult> hits = ragManager.search(ragCollection, prompt);
+                String ragCtx = RagManager.buildContextBlock(hits);
+                if (ragCtx != null) {
+                    effectiveSystem = effectiveSystem != null && !effectiveSystem.isEmpty()
+                            ? ragCtx + "\n\n" + effectiveSystem : ragCtx;
+                }
+            } catch (Exception e) {
+                System.err.println("[RAG search error: " + e.getMessage() + "]");
+            }
+        }
+
+        List<String[]> history = Collections.singletonList(new String[]{"user", prompt});
+        String fullPrompt = plugins.applyInterceptors(buildPrompt(history, effectiveSystem));
+
+        try (LlamaModel llama = new LlamaModel(model.getPath(), 0)) {
+            LlamaContext ctx = llama.createContext(nCtx, nThreads);
+            quietNativeLogs();
+            try {
+                ctx.generateStreaming(fullPrompt, numPredict, temperature, piece -> {
+                    System.out.print(piece);
+                    System.out.flush();
+                });
+                System.out.println();
+            } finally {
+                ctx.close();
+            }
+        }
+    }
+
+    private void runOnceSubprocess(ModelConfig model, String prompt) throws Exception {
+        String effectiveSystem = model.getSystemPrompt();
+        List<String[]> history = Collections.singletonList(new String[]{"user", prompt});
+        String fullPrompt = buildPrompt(history, effectiveSystem);
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add(model.getBinary());
+        cmd.add("-m"); cmd.add(model.getPath());
+        cmd.add("-p"); cmd.add(fullPrompt);
+        cmd.add("-n"); cmd.add(String.valueOf(
+                model.getNumPredict() != null ? model.getNumPredict() : DEFAULT_NUM_PREDICT));
+        cmd.add("-c"); cmd.add(String.valueOf(
+                model.getNumCtx() != null ? model.getNumCtx() : DEFAULT_N_CTX));
+        if (model.getNumThreads()  != null) { cmd.add("-t");     cmd.add(String.valueOf(model.getNumThreads())); }
+        if (model.getTemperature() != null) { cmd.add("--temp"); cmd.add(String.valueOf(model.getTemperature())); }
+        cmd.add("--no-display-prompt");
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.redirectError(ProcessBuilder.Redirect.INHERIT); // llama-cli logs → stderr
+        Process process = pb.start();
+        try (InputStream is = process.getInputStream()) {
+            is.transferTo(System.out);
+        }
+        System.out.println();
+        process.waitFor();
     }
 
     // ── Subprocess fallback ───────────────────────────────────────────────────
