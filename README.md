@@ -60,7 +60,7 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `add <name> --path <path>` | Register a model by pointing to a GGUF file |
 | `create <name> -f <file>` | Create a model from a Modelfile or Jllmfile |
 | `rm <name> [--purge]` | Remove a model from the registry (optionally delete the file) |
-| `run <name> [--rag <collection>]` | Start an interactive chat session with streaming output |
+| `run <name> [flags]` | Interactive REPL **or** non-interactive one-shot (pipe-friendly) |
 | `serve [--port <port>] [--max-concurrent <n>]` | Start the HTTP API server (default port: 11434) |
 | `rag add <collection> <path>` | Index a file or directory into a RAG collection |
 | `rag list` | List all RAG collections with chunk counts |
@@ -273,7 +273,17 @@ Lucene index files are managed entirely by jllm. Do not edit them by hand.
 
 ---
 
-## Interactive chat (`jllm run`)
+## Interactive chat and scripting (`jllm run`)
+
+`jllm run` operates in two modes selected automatically:
+
+| Situation | Mode |
+|---|---|
+| Terminal (no pipe) | **Interactive REPL** — streaming chat, multi-turn history |
+| `--prompt <text>` given | **Non-interactive** — generate once, print to stdout, exit |
+| stdin is piped (`\|` or `<`) | **Non-interactive** — read stdin as prompt, generate, exit |
+
+### Interactive REPL
 
 ```bash
 jllm run phi3:mini
@@ -309,7 +319,67 @@ Goodbye!
 
 **Multi-turn context:** conversation history is maintained across turns using ChatML format. Each generation re-processes the full accumulated history from position 0.
 
-**Subprocess fallback:** if `libllamajni.so` is not available, `run` falls back to launching `llama-cli` as a subprocess (requires `--binary` at registration time). The JNI path is always tried first.
+### Non-interactive / pipe mode
+
+When stdin is not a terminal, `jllm run` automatically switches to one-shot mode: it reads the full prompt, generates a response, streams it to stdout, and exits. No banner, no `You>` / `Assistant>` prefixes — stdout is the raw model output, ready for piping.
+
+```bash
+# Inline prompt via flag
+jllm run phi3:mini --prompt "Explain BM25 in one sentence."
+
+# Pipe from echo
+echo "What is the capital of Japan?" | jllm run phi3:mini
+
+# Pipe file content
+cat report.txt | jllm run phi3:mini --system "Summarise the following text."
+
+# Capture output into a variable
+ANSWER=$(jllm run phi3:mini --prompt "What is 2 + 2?")
+
+# Batch processing from a file
+while IFS= read -r q; do
+    echo "Q: $q"
+    echo "A: $(jllm run phi3:mini --prompt "$q" --temperature 0)"
+done < questions.txt
+
+# RAG + pipe — document Q&A in a script
+echo "What is the conclusion?" | jllm run phi3:mini --rag my-docs
+```
+
+llama-cli native logs go to stderr and can be silenced with `2>/dev/null` without affecting the answer in stdout.
+
+### Session flags
+
+All flags below apply to both interactive and non-interactive mode. They override the values stored in the model's Modelfile/Jllmfile **for this session only** — the registry entry is never modified.
+
+| Flag | Description |
+|---|---|
+| `--prompt <text>` | Prompt text for non-interactive one-shot generation |
+| `--rag <collection>` | Enable RAG retrieval from the named collection |
+| `--system <prompt>` | Replace the model's system prompt |
+| `--no-system` | Clear the system prompt entirely |
+| `--temperature <float>` | Sampling temperature (e.g. `0.0` for greedy, `1.2` for creative) |
+| `--max-tokens <int>` | Maximum tokens to generate (alias: `--num-predict`) |
+| `--ctx <int>` | Context window size in tokens (alias: `--num-ctx`) |
+| `--threads <int>` | CPU thread count for inference (alias: `--num-threads`) |
+
+Examples:
+
+```bash
+# Act as a translator for this session only
+jllm run phi3:mini --system "Translate every message to English. Output only the translation."
+
+# Deterministic output for testing (temperature 0 = greedy)
+jllm run phi3:mini --temperature 0 --prompt "What is 7 × 8?"
+
+# Larger context for a long document session
+jllm run phi3:mini --ctx 16384 --rag legal-docs
+
+# Erase the model's built-in persona and go bare
+jllm run phi3:mini --no-system --temperature 0.9
+```
+
+**Subprocess fallback:** if `libllamajni.so` is not available, `run` falls back to launching `llama-cli` as a subprocess (requires `--binary` at registration time). Both interactive and non-interactive modes support the fallback.
 
 ---
 
@@ -601,6 +671,18 @@ jllm run phi3:mini
 # Interactive chat with RAG over a document collection
 jllm rag add my-docs ~/documents/
 jllm run phi3:mini --rag my-docs
+
+# One-shot prompt (non-interactive, output goes to stdout)
+jllm run phi3:mini --prompt "Explain BM25 in one sentence."
+
+# Pipe a file through the model
+cat report.txt | jllm run phi3:mini --system "Summarise the following text."
+
+# Capture output into a shell variable
+ANSWER=$(jllm run phi3:mini --prompt "Capital of Japan?" --max-tokens 20)
+
+# Session overrides — temperature, context window, system prompt
+jllm run phi3:mini --temperature 0 --ctx 8192 --system "You are a strict JSON generator."
 
 # Start API server on the default port (11434)
 jllm serve
