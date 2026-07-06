@@ -14,9 +14,14 @@ import dev.localllm.rag.RagResult;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -207,6 +212,11 @@ public class ModelRunner {
                     }
                     if ("/help".equals(input)) {
                         printHelp(plugins);
+                        continue;
+                    }
+                    if (input.startsWith("/save")) {
+                        String arg = input.length() > 5 ? input.substring(5).trim() : "";
+                        saveConversation(history, model.getName(), baseSystem, arg);
                         continue;
                     }
                     if (input.isEmpty()) continue;
@@ -455,15 +465,17 @@ public class ModelRunner {
             System.out.println("System   : " + preview);
         }
         System.out.printf("Settings : temperature=%.2f  max_tokens=%d  context=%d%n", temp, numPredict, nCtx);
-        System.out.println("Commands : /clear  /help  /quit");
+        System.out.println("Commands : /clear  /save [file]  /help  /quit");
         System.out.println("-".repeat(60));
     }
 
     private static void printHelp(PluginManager pm) {
         System.out.println();
-        System.out.println("  /clear   Clear conversation history and start fresh");
-        System.out.println("  /help    Show this message");
-        System.out.println("  /quit    Exit the chat  (also: /exit, /bye, Ctrl+D)");
+        System.out.println("  /clear         Clear conversation history and start fresh");
+        System.out.println("  /save [file]   Save conversation log to a Markdown file");
+        System.out.println("                   (defaults to jllm-chat-YYYYMMDD-HHmmss.md)");
+        System.out.println("  /help          Show this message");
+        System.out.println("  /quit          Exit the chat  (also: /exit, /bye, Ctrl+D)");
         if (pm.hasTools()) {
             System.out.println();
             System.out.println("  Loaded tools:");
@@ -472,6 +484,46 @@ public class ModelRunner {
             }
         }
         System.out.println();
+    }
+
+    private static void saveConversation(List<String[]> history, String modelName,
+                                         String system, String fileArg) {
+        if (history.isEmpty()) {
+            System.out.println("[Nothing to save — conversation is empty]");
+            return;
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        String timestamp = now.format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        String displayTs = now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+
+        Path outPath;
+        if (fileArg.isEmpty()) {
+            outPath = Path.of("jllm-chat-" + timestamp + ".md");
+        } else {
+            outPath = Path.of(fileArg.replace("~", System.getProperty("user.home")));
+        }
+
+        try (BufferedWriter w = Files.newBufferedWriter(outPath, StandardCharsets.UTF_8)) {
+            w.write("# Chat — " + modelName + "\n");
+            w.write("*Saved: " + displayTs + "*\n");
+            if (system != null && !system.isEmpty()) {
+                w.write("\n**System prompt:** " + system.replace("\n", " ") + "\n");
+            }
+            w.write("\n---\n");
+
+            for (String[] msg : history) {
+                boolean isUser = "user".equals(msg[0]);
+                w.write("\n**" + (isUser ? "You" : "Assistant") + "**\n\n");
+                w.write(msg[1].trim() + "\n");
+                w.write("\n---\n");
+            }
+        } catch (Exception e) {
+            System.err.println("[Save failed: " + e.getMessage() + "]");
+            return;
+        }
+
+        System.out.println("[Saved to " + outPath.toAbsolutePath() + "]");
     }
 
     /** Drops native library INFO chatter once the model and context are loaded. */

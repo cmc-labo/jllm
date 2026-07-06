@@ -210,7 +210,7 @@ jllm run phi3:mini --rag my-docs
 Model    : phi3:mini
 Settings : temperature=0.80  max_tokens=512  context=4096
 RAG      : collection 'my-docs' (top-5 chunks per turn)
-Commands : /clear  /help  /quit
+Commands : /clear  /save [file]  /help  /quit
 ------------------------------------------------------------
 
 You> What does the paper say about multi-head attention?
@@ -294,7 +294,7 @@ Loads the model in-process via JNI and opens a streaming terminal REPL. Tokens a
 ```
 Model    : phi3:mini
 Settings : temperature=0.80  max_tokens=512  context=4096
-Commands : /clear  /help  /quit
+Commands : /clear  /save [file]  /help  /quit
 ------------------------------------------------------------
 
 You> Tell me a joke.
@@ -314,6 +314,7 @@ Goodbye!
 | Command | Description |
 |---|---|
 | `/clear` | Clear conversation history and reset context |
+| `/save [file]` | Save the conversation log to a Markdown file (auto-named if omitted) |
 | `/help` | Show available commands and loaded tools |
 | `/quit` | Exit (also: `/exit`, `/bye`, Ctrl+D) |
 
