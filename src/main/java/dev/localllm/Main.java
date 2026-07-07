@@ -4,6 +4,7 @@ import dev.localllm.model.JllmfileParser;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
+import dev.localllm.jni.LlamaModel;
 import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
 import dev.localllm.plugin.PromptInterceptor;
@@ -55,6 +56,7 @@ public class Main {
             case "info":    cmdInfo(args);      break;
             case "storage": cmdStorage();       break;
             case "plugins": cmdPlugins();       break;
+            case "version": cmdVersion();       break;
             default:
                 System.err.println("Unknown command: " + cmd);
                 printUsage();
@@ -488,6 +490,46 @@ public class Main {
         }
     }
 
+    private static void cmdVersion() {
+        System.out.println("jllm " + Version.JLLM);
+        System.out.println();
+
+        System.out.println("Runtime");
+        System.out.printf("  Java    : %s (%s)%n",
+                System.getProperty("java.version"),
+                System.getProperty("java.vendor"));
+        System.out.printf("  JVM     : %s %s%n",
+                System.getProperty("java.vm.name"),
+                System.getProperty("java.vm.version"));
+        System.out.printf("  OS      : %s %s (%s)%n",
+                System.getProperty("os.name"),
+                System.getProperty("os.version"),
+                System.getProperty("os.arch"));
+        System.out.println();
+
+        System.out.println("JNI");
+        boolean jniOk = LlamaModel.isNativeLibraryAvailable();
+        System.out.printf("  Status  : %s%n",
+                jniOk ? "available" : "not available (subprocess fallback mode)");
+        System.out.println();
+
+        System.out.println("Dependencies");
+        System.out.printf("  %-16s %s%n", "Gson",          Version.GSON);
+        System.out.printf("  %-16s %s%n", "SLF4J",         Version.SLF4J);
+        System.out.printf("  %-16s %s%n", "Logback",        Version.LOGBACK);
+        System.out.printf("  %-16s %s%n", "Undertow",       Version.UNDERTOW);
+        System.out.printf("  %-16s %s%n", "XNIO",           Version.XNIO);
+        System.out.printf("  %-16s %s%n", "Apache Lucene",  Version.LUCENE);
+        System.out.printf("  %-16s %s%n", "Apache PDFBox",  Version.PDFBOX);
+        System.out.println();
+
+        System.out.println("Storage");
+        System.out.printf("  %-10s %s%n", "Registry:", ModelRegistry.getRegistryFile());
+        System.out.printf("  %-10s %s%n", "Models:",   ModelRegistry.getManagedModelsDir());
+        System.out.printf("  %-10s %s%n", "Plugins:",  ModelRegistry.getPluginsDir());
+        System.out.printf("  %-10s %s%n", "RAG:",      ModelRegistry.getRagDir());
+    }
+
     // ── rag ───────────────────────────────────────────────────────────────────
 
     private static void cmdRag(String[] args) throws Exception {
@@ -669,6 +711,7 @@ public class Main {
         System.out.println("  show <name> [--yaml]                    Show model config (--yaml for Jllmfile format)");
         System.out.println("  info <name>                             Show model details");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");
+        System.out.println("  version                                 Show jllm version, runtime, and dependency info");
         System.out.println();
         System.out.println("Modelfile example (Ollama-compatible):");
         System.out.println("  FROM /path/to/model.gguf");

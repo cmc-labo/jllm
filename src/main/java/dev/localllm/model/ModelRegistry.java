@@ -21,6 +21,9 @@ public class ModelRegistry {
     private static final Path PLUGINS_DIR   = REGISTRY_DIR.resolve("plugins");
     private static final Path RAG_DIR       = REGISTRY_DIR.resolve("rag");
 
+    /** Returns the JSON file where model registrations are persisted. */
+    public static Path getRegistryFile() { return REGISTRY_FILE; }
+
     /** Returns the directory where managed GGUF files are stored. */
     public static Path getManagedModelsDir() { return MANAGED_DIR; }
 

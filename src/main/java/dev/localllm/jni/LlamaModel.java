@@ -39,6 +39,19 @@ public final class LlamaModel implements AutoCloseable {
     private final Cleaner.Cleanable cleanable;
     private volatile boolean closed = false;
 
+    /**
+     * Returns {@code true} if the JNI native library can be loaded on this machine.
+     * Safe to call before constructing any {@code LlamaModel} instance.
+     */
+    public static boolean isNativeLibraryAvailable() {
+        try {
+            NativeLibraryLoader.load();
+            return true;
+        } catch (UnsatisfiedLinkError e) {
+            return false;
+        }
+    }
+
     public LlamaModel(String path) {
         this(path, 0);
     }
