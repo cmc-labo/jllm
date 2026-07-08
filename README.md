@@ -55,6 +55,7 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 
 | Command | Description |
 |---|---|
+| `pull <owner>/<repo>[/<file.gguf>]` | Download a GGUF from HuggingFace and register it |
 | `list` | List registered models with disk status and total size |
 | `storage` | Per-model disk usage summary (managed vs. external vs. missing) |
 | `add <name> --path <path>` | Register a model by pointing to a GGUF file |
@@ -69,6 +70,45 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `show <name> [--yaml]` | Print the model's config (Modelfile or Jllmfile format) |
 | `info <name>` | Show model details |
 | `plugins` | List all loaded plugin tools and interceptors |
+| `version` | Show jllm version, runtime, and dependency info |
+
+### `pull` — Download from HuggingFace
+
+```bash
+# List available GGUF quantisations in a repo (pick one from the output)
+jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF
+
+# Download a specific file — auto-registered as "Llama-3.2-3B-Instruct-Q4_K_M"
+jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+# Register under a shorter alias
+jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf --name llama3.2:3b
+
+# Private / gated models — token via flag or environment variable
+export HF_TOKEN=hf_...
+jllm pull meta-llama/Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+```
+
+| Flag | Description |
+|---|---|
+| `--name <alias>` | Register the model under this name (default: filename without `.gguf`) |
+| `--branch <ref>` | HuggingFace branch or commit SHA (default: `main`) |
+| `--token <token>` | HF access token for private or gated models (or set `HF_TOKEN`) |
+| `--binary <path>` | Path to `llama-cli` binary (auto-detected if omitted) |
+| `--no-register` | Download only; skip registry entry |
+
+**Download behaviour:**
+- Files are saved to `~/.local-llm/models/<filename>.gguf` (managed storage).
+- A `.part` temp file is used during transfer and renamed on completion — a failed download leaves only the `.part` file, which is automatically cleaned up on retry.
+- If the destination file already exists the download is skipped.
+- Progress is shown live: `1.23 GB / 2.04 GB  [████████░░░░]  60%  18 MB/s  ETA 44s`
+
+After pulling, run directly:
+```bash
+jllm run Llama-3.2-3B-Instruct-Q4_K_M   # or whatever --name you chose
+```
+
+---
 
 ### `add` — Register a model
 
@@ -639,6 +679,12 @@ At inference time, parameters are resolved in this order:
 ## Examples
 
 ```bash
+# Download from HuggingFace and register automatically
+jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf --name llama3.2:3b
+
+# List available quantisations first, then pick one
+jllm pull bartowski/Phi-3.5-mini-instruct-GGUF
+
 # Register a model by path (no config file)
 jllm add phi3:mini --path ~/models/phi3-mini-q4.gguf --binary /usr/local/bin/llama-cli
 

@@ -8,6 +8,7 @@ import dev.localllm.jni.LlamaModel;
 import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
 import dev.localllm.plugin.PromptInterceptor;
+import dev.localllm.pull.HuggingFaceClient;
 import dev.localllm.rag.RagManager;
 import dev.localllm.rag.RagResult;
 import dev.localllm.runner.ModelRunner;
@@ -57,6 +58,7 @@ public class Main {
             case "storage": cmdStorage();       break;
             case "plugins": cmdPlugins();       break;
             case "version": cmdVersion();       break;
+            case "pull":    cmdPull(args);      break;
             default:
                 System.err.println("Unknown command: " + cmd);
                 printUsage();
@@ -490,6 +492,185 @@ public class Main {
         }
     }
 
+    // ── pull (HuggingFace download) ───────────────────────────────────────────
+
+    private static void cmdPull(String[] args) throws Exception {
+        if (args.length < 2) { printPullUsage(); System.exit(1); }
+
+        String  ref        = args[1];
+        String  name       = null;
+        String  branch     = "main";
+        String  token      = System.getenv("HF_TOKEN");
+        String  binary     = null;
+        boolean noRegister = false;
+
+        for (int i = 2; i < args.length; i++) {
+            switch (args[i]) {
+                case "--name":        if (i + 1 < args.length) name   = args[++i]; break;
+                case "--branch":      if (i + 1 < args.length) branch = args[++i]; break;
+                case "--token":       if (i + 1 < args.length) token  = args[++i]; break;
+                case "--binary":      if (i + 1 < args.length) binary = args[++i]; break;
+                case "--no-register": noRegister = true; break;
+                default:
+                    System.err.println("Unknown flag: " + args[i]);
+                    printPullUsage(); System.exit(1);
+            }
+        }
+
+        // Parse: owner/repo  or  owner/repo/filepath (filepath may contain '/')
+        int firstSlash  = ref.indexOf('/');
+        int secondSlash = firstSlash >= 0 ? ref.indexOf('/', firstSlash + 1) : -1;
+        if (firstSlash < 0) {
+            System.err.println("Error: expected <owner>/<repo>[/<file.gguf>] — got: " + ref);
+            System.exit(1);
+        }
+        String owner    = ref.substring(0, firstSlash);
+        String repo     = secondSlash > 0 ? ref.substring(firstSlash + 1, secondSlash)
+                                           : ref.substring(firstSlash + 1);
+        String filePath = secondSlash > 0 ? ref.substring(secondSlash + 1) : null;
+
+        if (owner.isEmpty() || repo.isEmpty()) {
+            System.err.println("Error: owner and repo must not be empty.");
+            System.exit(1);
+        }
+
+        HuggingFaceClient hf = new HuggingFaceClient(token);
+
+        // No filename → list GGUFs; auto-pick if exactly one.
+        if (filePath == null || filePath.isEmpty()) {
+            System.out.println("Fetching file list from " + owner + "/" + repo + " ...");
+            List<HuggingFaceClient.HfFile> ggufFiles;
+            try {
+                ggufFiles = hf.listGgufFiles(owner, repo);
+            } catch (Exception e) {
+                System.err.println("Error: " + e.getMessage());
+                System.exit(1); return;
+            }
+            if (ggufFiles.isEmpty()) {
+                System.err.println("No GGUF files found in " + owner + "/" + repo + ".");
+                System.exit(1);
+            }
+            if (ggufFiles.size() == 1) {
+                filePath = ggufFiles.get(0).name;
+                System.out.println("Found: " + filePath);
+                System.out.println();
+            } else {
+                System.out.println("Multiple GGUF files found. Pick one:");
+                System.out.println();
+                for (HuggingFaceClient.HfFile f : ggufFiles) {
+                    System.out.println("  jllm pull " + owner + "/" + repo + "/" + f.name);
+                }
+                System.out.println();
+                System.exit(0);
+            }
+        }
+
+        // Last segment of filePath = the actual filename on disk.
+        String fileName = filePath.contains("/")
+                ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath;
+
+        if (name == null) {
+            name = fileName.toLowerCase(Locale.ROOT).endsWith(".gguf")
+                    ? fileName.substring(0, fileName.length() - 5) : fileName;
+        }
+
+        Path dest = ModelRegistry.getManagedModelsDir().resolve(fileName);
+
+        // Download (skip if already present).
+        if (Files.exists(dest)) {
+            System.out.println("Already downloaded: " + dest + "  (" + formatSize(Files.size(dest)) + ")");
+            System.out.println("Skipping download. Delete the file first to force a re-download.");
+            System.out.println();
+        } else {
+            System.out.println("Source : " + owner + "/" + repo + "/" + filePath + "  (branch: " + branch + ")");
+            System.out.println("Dest   : " + dest);
+            System.out.println();
+
+            long[] startMs = {System.currentTimeMillis()};
+            try {
+                hf.download(owner, repo, filePath, branch, dest, (downloaded, total) ->
+                        printPullProgress(downloaded, total, startMs[0]));
+            } catch (Exception e) {
+                System.out.println();
+                System.err.println("Download failed: " + e.getMessage());
+                System.exit(1);
+            }
+            System.out.println(); // end of progress line
+            System.out.println("Complete: " + formatSize(Files.size(dest)));
+            System.out.println();
+        }
+
+        // Register.
+        if (!noRegister) {
+            if (registry.get(name).isPresent()) {
+                System.out.println("Note: '" + name + "' already registered — updating entry.");
+            }
+            if (binary == null) binary = detectLlamaBinary();
+            ModelConfig model = new ModelConfig();
+            model.setName(name);
+            model.setPath(dest.toString());
+            model.setBinary(binary);
+            model.setFormat("gguf");
+            model.setSizeBytes(Files.size(dest));
+            model.setAddedAt(Instant.now().toString());
+            registry.add(model);
+            System.out.println("Registered: " + name);
+            System.out.println("Run with : jllm run " + name);
+        }
+    }
+
+    private static void printPullProgress(long downloaded, long total, long startMs) {
+        long elapsed = Math.max(1, System.currentTimeMillis() - startMs);
+        double bps   = downloaded * 1000.0 / elapsed;
+
+        String downStr  = formatSize(downloaded);
+        String speedStr = formatSize((long) bps) + "/s";
+        String totalStr = total > 0 ? " / " + formatSize(total) : "";
+
+        String pct = "";
+        String bar = "";
+        String eta = "";
+        if (total > 0) {
+            int p = (int) (downloaded * 100 / total);
+            pct = String.format("  %3d%%", p);
+            int width  = 20;
+            int filled = (int) (downloaded * width / total);
+            bar = "  [" + "█".repeat(filled) + "░".repeat(width - filled) + "]";
+            if (bps > 0) {
+                eta = "  ETA " + formatEta((long) ((total - downloaded) / bps));
+            }
+        }
+
+        System.out.printf("\r  %s%s  %s%s%s%s          ",
+                downStr, totalStr, speedStr, bar, pct, eta);
+        System.out.flush();
+    }
+
+    private static String formatEta(long seconds) {
+        if (seconds < 60)   return seconds + "s";
+        if (seconds < 3600) return (seconds / 60) + "m " + (seconds % 60) + "s";
+        return (seconds / 3600) + "h " + ((seconds % 3600) / 60) + "m";
+    }
+
+    private static void printPullUsage() {
+        System.out.println("Usage: jllm pull <owner>/<repo>[/<file.gguf>] [options]");
+        System.out.println();
+        System.out.println("Options:");
+        System.out.println("  --name <alias>    Register the model under this name (default: filename without .gguf)");
+        System.out.println("  --branch <ref>    HuggingFace branch or commit (default: main)");
+        System.out.println("  --token <token>   HuggingFace access token for private/gated models");
+        System.out.println("                    (can also be set via HF_TOKEN environment variable)");
+        System.out.println("  --binary <path>   Path to llama-cli binary (auto-detected if omitted)");
+        System.out.println("  --no-register     Download only; do not register in jllm");
+        System.out.println();
+        System.out.println("Examples:");
+        System.out.println("  jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF");
+        System.out.println("       (lists available GGUF files in the repo)");
+        System.out.println("  jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf");
+        System.out.println("  jllm pull bartowski/Phi-3.5-mini-instruct-GGUF/Phi-3.5-mini-instruct-Q4_K_M.gguf --name phi3.5");
+        System.out.println("  jllm pull lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf --token hf_...");
+    }
+
     private static void cmdVersion() {
         System.out.println("jllm " + Version.JLLM);
         System.out.println();
@@ -710,6 +891,11 @@ public class Main {
         System.out.println("  rag rm <collection>                     Delete a RAG collection");
         System.out.println("  show <name> [--yaml]                    Show model config (--yaml for Jllmfile format)");
         System.out.println("  info <name>                             Show model details");
+        System.out.println("  pull <owner>/<repo>[/<file.gguf>]        Download a GGUF from HuggingFace and register it");
+        System.out.println("       [--name <alias>]                   Register with a custom name");
+        System.out.println("       [--branch <ref>]                   HuggingFace branch or commit (default: main)");
+        System.out.println("       [--token <token>]                  HF access token (or set HF_TOKEN env var)");
+        System.out.println("       [--no-register]                    Download only, skip registration");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");
         System.out.println("  version                                 Show jllm version, runtime, and dependency info");
         System.out.println();
