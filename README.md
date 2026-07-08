@@ -168,6 +168,43 @@ jllm serve --max-concurrent 4
 
 On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project Loom) — created instantly, with no OS thread per connection. Requests blocked on the semaphore waiting for an inference slot unmount their virtual thread so no OS thread is wasted. On **Java 11–20**, a cached platform thread pool is used instead; the semaphore still applies.
 
+**Context pool:** `LlamaContext` instances (which hold the KV cache buffer — typically 400 MB–8 GB depending on model and `num_ctx`) are pooled and reused across requests rather than allocated and freed on every call. The pool holds up to `--max-concurrent` idle contexts per model configuration. Pool hit rate and current idle state are exposed via `GET /api/ps`.
+
+### `version` — Show environment info
+
+```bash
+jllm version
+```
+
+```
+jllm 0.1.0
+
+Runtime
+  Java    : 11.0.25 (Ubuntu)
+  JVM     : OpenJDK 64-Bit Server VM 11.0.25+9
+  OS      : Linux 5.15.0-89-generic (aarch64)
+
+JNI
+  Status  : available
+
+Dependencies
+  Gson             2.10.1
+  SLF4J            2.0.13
+  Logback          1.5.6
+  Undertow         2.3.14.Final
+  XNIO             3.8.14.Final
+  Apache Lucene    9.11.1
+  Apache PDFBox    3.0.3
+
+Storage
+  Registry:  /home/user/.local-llm/models.json
+  Models:    /home/user/.local-llm/models
+  Plugins:   /home/user/.local-llm/plugins
+  RAG:       /home/user/.local-llm/rag
+```
+
+Useful for bug reports and verifying the active JNI library status.
+
 ---
 
 ## RAG — local document search (`jllm rag`)
@@ -777,7 +814,10 @@ All endpoints respond with `Access-Control-Allow-Origin: *` CORS headers so brow
 connect directly. `OPTIONS` preflight requests are handled automatically.
 
 The model named in `model` is loaded into memory on first use and kept resident for subsequent
-requests (no reload-per-request); each request gets its own short-lived inference context.
+requests (no reload-per-request). `LlamaContext` instances (which own the KV cache buffer) are
+**pooled and reused** across requests via a `ContextPool` rather than allocated fresh on every call.
+The pool holds up to `--max-concurrent` idle contexts per model configuration; pool metrics are
+exposed at `GET /api/ps`.
 
 **Prompt interceptors** loaded from `~/.local-llm/plugins/` are applied to every prompt in all
 handlers — both Ollama and OpenAI endpoints.
@@ -790,6 +830,7 @@ handlers — both Ollama and OpenAI endpoints.
 | `POST` | `/api/show`             | Ollama  | Model details (Modelfile + parameters) |
 | `POST` | `/api/generate`         | Ollama  | Text generation |
 | `POST` | `/api/chat`             | Ollama  | Chat completion |
+| `GET`  | `/api/ps`               | Ollama  | Context pool stats and idle context count |
 | `GET`  | `/v1/models`            | OpenAI  | List models |
 | `POST` | `/v1/chat/completions`  | OpenAI  | Chat completion |
 | `POST` | `/v1/completions`       | OpenAI  | Text completion |
@@ -887,6 +928,36 @@ curl http://localhost:11434/api/tags
 }
 ```
 
+### `GET /api/ps` — Context pool status
+
+```bash
+curl http://localhost:11434/api/ps
+```
+
+```json
+{
+  "models": [
+    {
+      "name": "phi3:mini",
+      "idle_contexts": 1,
+      "num_ctx": 4096,
+      "num_threads": 4,
+      "size_bytes": 2394025984
+    }
+  ],
+  "pool_stats": {
+    "hits": 47,
+    "misses": 2,
+    "hit_rate_pct": 95.9,
+    "total_idle": 1,
+    "distinct_keys": 1,
+    "evictions": 0
+  }
+}
+```
+
+`idle_contexts` is the number of `LlamaContext` instances currently sitting idle in the pool, ready to serve the next request without a KV cache allocation. `hit_rate_pct` is the fraction of requests that received a pooled context rather than allocating a new one.
+
 ### `POST /api/generate` — Generate text
 
 ```bash
@@ -975,7 +1046,8 @@ local-llm-env/
 ├── src/main/resources/
 │   └── logback.xml                       # Default Logback config
 └── src/main/java/dev/localllm/
-    ├── Main.java                         # CLI entry point
+    ├── Main.java                         # CLI entry point (all sub-commands)
+    ├── Version.java                      # Compile-time version constants for all bundled deps
     ├── model/
     │   ├── ModelConfig.java              # Model POJO (path, parameters, system prompt, …)
     │   ├── Modelfile.java                # Modelfile parser and serializer (Ollama-compatible)
@@ -985,6 +1057,8 @@ local-llm-env/
     │   ├── LlmTool.java                  # SPI: function-calling tool interface
     │   ├── PromptInterceptor.java        # SPI: prompt transformation interface
     │   └── PluginManager.java            # JAR scanner, URLClassLoader, interceptor chain
+    ├── pull/
+    │   └── HuggingFaceClient.java        # HF Hub API: list GGUF files + stream download
     ├── rag/
     │   ├── RagResult.java                # Search result POJO (source, page, chunk, BM25 score)
     │   ├── DocumentChunker.java          # Split text into overlapping word-level chunks
@@ -994,7 +1068,8 @@ local-llm-env/
     ├── runner/
     │   └── ModelRunner.java              # Interactive REPL: JNI streaming + tool calling loop + RAG
     ├── server/
-    │   └── ApiServer.java                # Undertow HTTP server: Ollama + OpenAI APIs + RAG
+    │   ├── ApiServer.java                # Undertow HTTP server: Ollama + OpenAI APIs + RAG
+    │   └── ContextPool.java              # LlamaContext pool: KV cache reuse across requests
     └── jni/
         ├── LlamaNative.java              # Raw native method declarations
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
@@ -1187,7 +1262,9 @@ early `break` (e.g. a client disconnecting mid-response in `ApiServer`) can't le
 
 ### Concurrency
 
-A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. `LlamaContext` guards every native call with a lock, so calls on a *shared* context are serialized rather than racing — but for actual parallel generation across users, create one `LlamaContext` per concurrent request via `LlamaModel.createContext()`. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design). `ApiServer` follows exactly this pattern: one shared `LlamaModel` per registered model, loaded lazily on first request, and a fresh `LlamaContext` (closed when the request ends) per request — so concurrent requests against the same model run truly in parallel rather than queuing behind the lock. A context pool (to avoid paying KV-cache allocation cost on every request) would be a reasonable next optimization but isn't implemented yet.
+A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. `LlamaContext` guards every native call with a lock, so calls on a *shared* context are serialized rather than racing — but for actual parallel generation across users, create one `LlamaContext` per concurrent request via `LlamaModel.createContext()`. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design).
+
+`ApiServer` follows this pattern: one shared `LlamaModel` per registered model (loaded lazily on first request) plus a `ContextPool` that pools `LlamaContext` instances keyed by `(modelName, nCtx, nThreads)`. After each request finishes, its context is returned to the pool rather than closed, so the next request for the same model configuration pays no KV cache allocation or deallocation cost — only the first request per key allocates a new context. Reuse is safe because `generateTokens()` always decodes the full prompt token sequence starting at KV cache position 0, overwriting any entries from the previous request. The pool is bounded by `--max-concurrent` idle contexts per key; extras are closed immediately on return. Pool metrics (`hits`, `misses`, `hit_rate`, `idle`) are exposed at `GET /api/ps`.
 
 ### Crash containment
 
