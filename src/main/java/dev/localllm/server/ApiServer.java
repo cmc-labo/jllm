@@ -104,6 +104,11 @@ public class ApiServer {
     // park cheaply on virtual threads instead of creating more OS threads.
     private final Semaphore inferenceSemaphore;
 
+    // Reuses LlamaContext instances (i.e. KV cache buffers) across requests to
+    // avoid repeated native-heap allocation. Size = maxConcurrent so the pool
+    // can absorb every context that could ever be in flight simultaneously.
+    private final ContextPool contextPool;
+
     private final Map<String, LlamaModel> loadedModels = new ConcurrentHashMap<>();
     private final Gson prettyGson;
     private final Gson compactGson;
@@ -129,6 +134,7 @@ public class ApiServer {
         this.maxConcurrent      = maxConcurrent;
         this.requestExecutor    = createExecutor();
         this.inferenceSemaphore = new Semaphore(maxConcurrent);
+        this.contextPool        = new ContextPool(maxConcurrent);
         this.prettyGson         = new GsonBuilder().setPrettyPrinting().create();
         this.compactGson        = new Gson();
     }
@@ -178,6 +184,7 @@ public class ApiServer {
             .get("/",                     b(this::handleRoot))
             // ── Ollama API ────────────────────────────────────────────────────
             .get("/api/tags",             b(this::handleTags))
+            .get("/api/ps",               b(this::handlePs))
             .post("/api/show",            b(this::handleShow))
             .post("/api/generate",        b(this::handleGenerate))
             .post("/api/chat",            b(this::handleChat))
@@ -200,6 +207,7 @@ public class ApiServer {
             System.out.println("Threads          : Platform (cached pool) — upgrade to Java 21+ for Virtual Threads");
         }
         System.out.printf("Max concurrent   : %d inference slot(s) (--max-concurrent to change)%n", maxConcurrent);
+        System.out.printf("Context pool     : enabled — up to %d idle context(s) per model config%n", maxConcurrent);
         System.out.println();
         System.out.println("Ollama-compatible:");
         System.out.printf("  GET  /api/tags              http://localhost:%d/api/tags%n", port);
@@ -261,7 +269,48 @@ public class ApiServer {
     // ── Root ──────────────────────────────────────────────────────────────────
 
     private void handleRoot(HttpServerExchange ex) throws Exception {
-        sendJson(ex, 200, map("name", "local-llm", "version", "1.0.0"));
+        ContextPool.PoolStats ps = contextPool.stats();
+        sendJson(ex, 200, map(
+            "name",    "local-llm",
+            "version", "1.0.0",
+            "ctx_pool", map(
+                "hits",      ps.hits,
+                "misses",    ps.misses,
+                "hit_rate",  String.format("%.1f%%", ps.hitRate()),
+                "idle",      ps.totalIdle,
+                "evictions", ps.evictions
+            )
+        ));
+    }
+
+    // ── Ollama: GET /api/ps ───────────────────────────────────────────────────
+
+    private void handlePs(HttpServerExchange ex) throws Exception {
+        ContextPool.PoolStats ps = contextPool.stats();
+        List<Map<String, Object>> models = new ArrayList<>();
+        for (ContextPool.KeyStats ks : ps.byKey) {
+            // key format: "modelName|nCtx|nThreads"
+            String[] parts = ks.key.split("\\|", 3);
+            String modelName = parts[0];
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name",          modelName);
+            entry.put("idle_contexts", ks.idleContexts);
+            entry.put("num_ctx",       parts.length > 1 ? parts[1] : "?");
+            entry.put("num_threads",   parts.length > 2 ? parts[2] : "?");
+            ModelConfig cfg = registry.get(modelName).orElse(null);
+            if (cfg != null) entry.put("size_bytes", cfg.getSizeBytes());
+            models.add(entry);
+        }
+        sendJson(ex, 200, map(
+            "models",    models,
+            "pool_stats", map(
+                "hits",      ps.hits,
+                "misses",    ps.misses,
+                "hit_rate",  String.format("%.1f%%", ps.hitRate()),
+                "total_idle", ps.totalIdle,
+                "evictions", ps.evictions
+            )
+        ));
     }
 
     // ── Ollama: GET /api/tags ─────────────────────────────────────────────────
@@ -320,10 +369,9 @@ public class ApiServer {
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
         inferenceSemaphore.acquire();
+        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
-                 LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
-
+            try (LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
                 if (opts.stream) {
                     beginNdjson(ex);
                     try (OutputStream os = ex.getOutputStream()) {
@@ -335,11 +383,12 @@ public class ApiServer {
                     for (String t : ts) sb.append(t);
                     sendJson(ex, 200, ollamaGenerateChunk(modelName, sb.toString(), true));
                 }
-            } catch (Exception e) {
-                LOG.error("generate failed for '{}'", modelName, e);
-                if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
             }
+        } catch (Exception e) {
+            LOG.error("generate failed for '{}'", modelName, e);
+            if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
         } finally {
+            contextPool.release(modelName, nCtx, nThreads, ctx);
             inferenceSemaphore.release();
         }
     }
@@ -365,10 +414,9 @@ public class ApiServer {
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
         inferenceSemaphore.acquire();
+        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
-                 LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
-
+            try (LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
                 if (opts.stream) {
                     beginNdjson(ex);
                     try (OutputStream os = ex.getOutputStream()) {
@@ -380,11 +428,12 @@ public class ApiServer {
                     for (String t : ts) sb.append(t);
                     sendJson(ex, 200, ollamaChatChunk(modelName, sb.toString(), true));
                 }
-            } catch (Exception e) {
-                LOG.error("chat failed for '{}'", modelName, e);
-                if (!ex.isResponseStarted()) sendError(ex, 500, "chat failed: " + e.getMessage());
             }
+        } catch (Exception e) {
+            LOG.error("chat failed for '{}'", modelName, e);
+            if (!ex.isResponseStarted()) sendError(ex, 500, "chat failed: " + e.getMessage());
         } finally {
+            contextPool.release(modelName, nCtx, nThreads, ctx);
             inferenceSemaphore.release();
         }
     }
@@ -425,10 +474,9 @@ public class ApiServer {
         long created = Instant.now().getEpochSecond();
 
         inferenceSemaphore.acquire();
+        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
-                 LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
-
+            try (LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
                 if (opts.stream) {
                     beginSse(ex);
                     try (OutputStream os = ex.getOutputStream()) {
@@ -443,11 +491,12 @@ public class ApiServer {
                     for (String t : ts) sb.append(t);
                     sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
                 }
-            } catch (Exception e) {
-                LOG.error("v1/chat/completions failed for '{}'", modelName, e);
-                if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
             }
+        } catch (Exception e) {
+            LOG.error("v1/chat/completions failed for '{}'", modelName, e);
+            if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
         } finally {
+            contextPool.release(modelName, nCtx, nThreads, ctx);
             inferenceSemaphore.release();
         }
     }
@@ -473,10 +522,9 @@ public class ApiServer {
         long created = Instant.now().getEpochSecond();
 
         inferenceSemaphore.acquire();
+        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext ctx = model.createContext(nCtx, nThreads);
-                 LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
-
+            try (LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
                 if (opts.stream) {
                     beginSse(ex);
                     try (OutputStream os = ex.getOutputStream()) {
@@ -490,11 +538,12 @@ public class ApiServer {
                     for (String t : ts) sb.append(t);
                     sendJson(ex, 200, openAiCompletionResponse(id, modelName, created, sb.toString()));
                 }
-            } catch (Exception e) {
-                LOG.error("v1/completions failed for '{}'", modelName, e);
-                if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
             }
+        } catch (Exception e) {
+            LOG.error("v1/completions failed for '{}'", modelName, e);
+            if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
         } finally {
+            contextPool.release(modelName, nCtx, nThreads, ctx);
             inferenceSemaphore.release();
         }
     }
