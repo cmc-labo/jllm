@@ -57,6 +57,7 @@ public class Main {
             case "info":    cmdInfo(args);      break;
             case "storage": cmdStorage();       break;
             case "plugins": cmdPlugins();       break;
+            case "update":  cmdUpdate(args);    break;
             case "version": cmdVersion();       break;
             case "pull":    cmdPull(args);      break;
             default:
@@ -216,6 +217,115 @@ public class Main {
         registry.add(model);
         System.out.println("Created '" + name + "' (" + formatSize(model.getSizeBytes()) + ")");
         printModelfileParams(model);
+    }
+
+    private static void cmdUpdate(String[] args) throws Exception {
+        if (args.length < 2) { printUpdateUsage(); System.exit(1); }
+        String name = args[1];
+
+        ModelConfig model = registry.get(name).orElse(null);
+        if (model == null) {
+            System.err.println("Model '" + name + "' not found. Run 'jllm list' to see available models.");
+            System.exit(1);
+        }
+
+        if (args.length == 2) {
+            System.out.println("Current configuration for '" + name + "':");
+            printModelfileParams(model);
+            System.out.println();
+            printUpdateUsage();
+            return;
+        }
+
+        // Snapshot before changes (for diff output)
+        Float   prevTemp    = model.getTemperature();
+        Integer prevPredict = model.getNumPredict();
+        Integer prevCtx     = model.getNumCtx();
+        Integer prevThreads = model.getNumThreads();
+        String  prevSystem  = model.getSystemPrompt();
+        String  prevPath    = model.getPath();
+        String  prevBinary  = model.getBinary();
+
+        for (int i = 2; i < args.length; i++) {
+            switch (args[i]) {
+                case "--temperature":
+                    if (i + 1 < args.length) model.setTemperature(Float.parseFloat(args[++i]));
+                    break;
+                case "--max-tokens": case "--num-predict":
+                    if (i + 1 < args.length) model.setNumPredict(Integer.parseInt(args[++i]));
+                    break;
+                case "--ctx": case "--num-ctx":
+                    if (i + 1 < args.length) model.setNumCtx(Integer.parseInt(args[++i]));
+                    break;
+                case "--threads": case "--num-threads":
+                    if (i + 1 < args.length) model.setNumThreads(Integer.parseInt(args[++i]));
+                    break;
+                case "--system":
+                    if (i + 1 < args.length) model.setSystemPrompt(args[++i]);
+                    break;
+                case "--no-system":
+                    model.setSystemPrompt(null);
+                    break;
+                case "--path":
+                    if (i + 1 < args.length) {
+                        String p = args[++i];
+                        if (!Files.exists(Paths.get(p))) {
+                            System.err.println("File not found: " + p);
+                            System.exit(1);
+                        }
+                        model.setPath(p);
+                        model.setSizeBytes(Files.size(Paths.get(p)));
+                    }
+                    break;
+                case "--binary":
+                    if (i + 1 < args.length) model.setBinary(args[++i]);
+                    break;
+                case "--unset":
+                    if (i + 1 < args.length) {
+                        String param = args[++i];
+                        switch (param) {
+                            case "temperature":                        model.setTemperature(null);   break;
+                            case "max-tokens": case "num-predict":     model.setNumPredict(null);    break;
+                            case "ctx":        case "num-ctx":         model.setNumCtx(null);        break;
+                            case "threads":    case "num-threads":     model.setNumThreads(null);    break;
+                            case "system":                             model.setSystemPrompt(null);  break;
+                            default:
+                                System.err.println("Unknown parameter '" + param + "'.");
+                                System.err.println("Unset-able params: temperature  max-tokens  ctx  threads  system");
+                                System.exit(1);
+                        }
+                    }
+                    break;
+                default:
+                    System.err.println("Unknown flag: " + args[i]);
+                    printUpdateUsage();
+                    System.exit(1);
+            }
+        }
+
+        boolean changed =
+                !objEq(prevTemp,    model.getTemperature())  ||
+                !objEq(prevPredict, model.getNumPredict())   ||
+                !objEq(prevCtx,     model.getNumCtx())       ||
+                !objEq(prevThreads, model.getNumThreads())   ||
+                !objEq(prevSystem,  model.getSystemPrompt()) ||
+                !objEq(prevPath,    model.getPath())         ||
+                !objEq(prevBinary,  model.getBinary());
+
+        if (!changed) {
+            System.out.println("No changes — configuration already matches the given values.");
+            return;
+        }
+
+        registry.add(model);
+        System.out.println("Updated '" + name + "':");
+        printParamDiff("temperature", prevTemp,    model.getTemperature());
+        printParamDiff("num_predict", prevPredict, model.getNumPredict());
+        printParamDiff("num_ctx",     prevCtx,     model.getNumCtx());
+        printParamDiff("num_threads", prevThreads, model.getNumThreads());
+        printParamDiff("system",      prevSystem,  model.getSystemPrompt());
+        printParamDiff("path",        prevPath,    model.getPath());
+        printParamDiff("binary",      prevBinary,  model.getBinary());
     }
 
     private static void cmdRemove(String[] args) throws Exception {
@@ -830,6 +940,51 @@ public class Main {
         }
     }
 
+    private static void printUpdateUsage() {
+        System.out.println("Usage: jllm update <name> [options]");
+        System.out.println();
+        System.out.println("  Modify registered model parameters in place.");
+        System.out.println("  Only the flags you pass are changed; everything else stays the same.");
+        System.out.println();
+        System.out.println("Options:");
+        System.out.println("  --temperature <float>    Set temperature (e.g. 0.7)");
+        System.out.println("  --max-tokens <int>       Set max output tokens (num_predict)");
+        System.out.println("  --ctx <int>              Set context window size (num_ctx)");
+        System.out.println("  --threads <int>          Set CPU thread count (num_threads)");
+        System.out.println("  --system <text>          Set system prompt");
+        System.out.println("  --no-system              Clear system prompt");
+        System.out.println("  --path <path>            Update GGUF file path (also recalculates size)");
+        System.out.println("  --binary <path>          Update llama.cpp binary path");
+        System.out.println("  --unset <param>          Reset a parameter to the runtime default (null)");
+        System.out.println("                           Params: temperature | max-tokens | ctx | threads | system");
+        System.out.println();
+        System.out.println("Examples:");
+        System.out.println("  jllm update phi3:mini --temperature 0.2");
+        System.out.println("  jllm update phi3:mini --ctx 8192 --threads 8");
+        System.out.println("  jllm update phi3:mini --system \"You are a coding assistant.\"");
+        System.out.println("  jllm update phi3:mini --no-system");
+        System.out.println("  jllm update phi3:mini --unset temperature");
+        System.out.println("  jllm update phi3:mini --path /new/path/to/model.gguf");
+    }
+
+    private static boolean objEq(Object a, Object b) {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        return a.equals(b);
+    }
+
+    private static void printParamDiff(String label, Object before, Object after) {
+        if (objEq(before, after)) return;
+        System.out.printf("  %-14s %s  →  %s%n", label, paramValStr(before), paramValStr(after));
+    }
+
+    private static String paramValStr(Object v) {
+        if (v == null) return "(not set)";
+        String s = v.toString().replace("\n", "\\n");
+        if (s.length() > 55) s = s.substring(0, 52) + "...";
+        return s.contains(" ") ? "\"" + s + "\"" : s;
+    }
+
     private static boolean isYamlFile(String path) {
         String lower = path.toLowerCase(Locale.ROOT);
         return lower.endsWith(".yaml") || lower.endsWith(".yml")
@@ -873,6 +1028,16 @@ public class Main {
         System.out.println("  create <name> -f <file>                 Create a model from a Modelfile or Jllmfile (.yaml/.yml)");
         System.out.println("                [--binary <path>]         Path to llama.cpp binary");
         System.out.println("  rm <name> [--purge]                     Remove a model (--purge also deletes the file)");
+        System.out.println("  update <name>                           Update model parameters in place");
+        System.out.println("             [--temperature <float>]      Set temperature");
+        System.out.println("             [--max-tokens <int>]         Set max output tokens");
+        System.out.println("             [--ctx <int>]                Set context window size");
+        System.out.println("             [--threads <int>]            Set CPU thread count");
+        System.out.println("             [--system <text>]            Set system prompt");
+        System.out.println("             [--no-system]                Clear system prompt");
+        System.out.println("             [--path <path>]              Update GGUF file path");
+        System.out.println("             [--binary <path>]            Update binary path");
+        System.out.println("             [--unset <param>]            Reset a parameter to runtime default");
         System.out.println("  run <name>                              Start an interactive chat session");
         System.out.println("             [--prompt <text>]            One-shot: generate and exit (pipe-friendly)");
         System.out.println("             [--rag <collection>]         Enable RAG retrieval");

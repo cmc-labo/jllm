@@ -61,6 +61,7 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `add <name> --path <path>` | Register a model by pointing to a GGUF file |
 | `create <name> -f <file>` | Create a model from a Modelfile or Jllmfile |
 | `rm <name> [--purge]` | Remove a model from the registry (optionally delete the file) |
+| `update <name> [flags]` | Modify registered model parameters in place without re-registering |
 | `run <name> [flags]` | Interactive REPL **or** non-interactive one-shot (pipe-friendly) |
 | `serve [--port <port>] [--max-concurrent <n>]` | Start the HTTP API server (default port: 11434) |
 | `rag add <collection> <path>` | Index a file or directory into a RAG collection |
@@ -145,6 +146,50 @@ jllm rm phi3:mini --purge      # remove from registry AND delete the file
 ```
 
 `--purge` prints how many bytes were freed.
+
+### `update` — Modify model parameters in place
+
+```bash
+# Show current config (no flags = display only)
+jllm update phi3:mini
+
+# Set or change individual parameters
+jllm update phi3:mini --temperature 0.2
+jllm update phi3:mini --ctx 8192 --threads 8
+jllm update phi3:mini --system "You are a strict JSON generator. Output only valid JSON."
+jllm update phi3:mini --max-tokens 2048
+
+# Clear system prompt
+jllm update phi3:mini --no-system
+
+# Reset a parameter to the runtime default (removes it from the stored config)
+jllm update phi3:mini --unset temperature
+
+# Move the GGUF file — update the registered path and recalculate size
+jllm update phi3:mini --path /new/location/phi3-mini.gguf
+```
+
+| Flag | Description |
+|---|---|
+| `--temperature <float>` | Set sampling temperature |
+| `--max-tokens <int>` | Set max output tokens (`num_predict`) |
+| `--ctx <int>` | Set context window size (`num_ctx`) |
+| `--threads <int>` | Set CPU thread count (`num_threads`) |
+| `--system <text>` | Set system prompt |
+| `--no-system` | Clear the stored system prompt |
+| `--path <path>` | Update GGUF file path (also recalculates stored size) |
+| `--binary <path>` | Update the `llama-cli` binary path |
+| `--unset <param>` | Reset a parameter to `null` (runtime default). Params: `temperature` \| `max-tokens` \| `ctx` \| `threads` \| `system` |
+
+Only the flags you pass are changed; everything else stays the same. Changes are
+shown as a before→after diff:
+
+```
+Updated 'phi3:mini':
+  temperature    (not set)  →  0.2
+  num_ctx        (not set)  →  8192
+  system         (not set)  →  "You are a strict JSON generator..."
+```
 
 ### `show` — Print model config
 
