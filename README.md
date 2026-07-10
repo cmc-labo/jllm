@@ -124,6 +124,15 @@ jllm add phi3:mini --path ~/models/phi3-mini-q4.gguf --binary /usr/local/bin/lla
 | `--format <fmt>` | Model format (default: `gguf`) |
 | `--managed` | Copy the file into `~/.local-llm/models/` (managed storage) before registering |
 
+At registration time, the GGUF binary header is automatically read to extract model metadata. This is printed immediately and stored in the registry:
+
+```
+Registered 'phi3:mini' (2.2 GB)
+  GGUF:  arch=phi3  quant=Q4_K_M  params=3.82B  ctx=4096
+```
+
+The same metadata is available via `jllm info` and visible in the `QUANT` / `PARAMS` columns of `jllm list`. If the GGUF file lacks a particular field (e.g. `general.parameter_count` is absent in some files), that field is shown as `-`.
+
 ### `create` — Create from a config file
 
 ```bash
@@ -177,8 +186,9 @@ jllm update phi3:mini --path /new/location/phi3-mini.gguf
 | `--threads <int>` | Set CPU thread count (`num_threads`) |
 | `--system <text>` | Set system prompt |
 | `--no-system` | Clear the stored system prompt |
-| `--path <path>` | Update GGUF file path (also recalculates stored size) |
+| `--path <path>` | Update GGUF file path (also recalculates size and re-reads GGUF metadata) |
 | `--binary <path>` | Update the `llama-cli` binary path |
+| `--refresh-gguf` | Re-read GGUF metadata from the current file (useful for models added before this feature existed) |
 | `--unset <param>` | Reset a parameter to `null` (runtime default). Params: `temperature` \| `max-tokens` \| `ctx` \| `threads` \| `system` |
 
 Only the flags you pass are changed; everything else stays the same. Changes are
@@ -1094,7 +1104,8 @@ local-llm-env/
     ├── Main.java                         # CLI entry point (all sub-commands)
     ├── Version.java                      # Compile-time version constants for all bundled deps
     ├── model/
-    │   ├── ModelConfig.java              # Model POJO (path, parameters, system prompt, …)
+    │   ├── ModelConfig.java              # Model POJO (path, parameters, system prompt, GGUF metadata)
+    │   ├── GgufReader.java               # GGUF binary header parser (KV section only; no tensor data)
     │   ├── Modelfile.java                # Modelfile parser and serializer (Ollama-compatible)
     │   ├── JllmfileParser.java           # Jllmfile parser and serializer (YAML format)
     │   └── ModelRegistry.java            # Persists registry to ~/.local-llm/models.json

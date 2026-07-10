@@ -1,5 +1,6 @@
 package dev.localllm;
 
+import dev.localllm.model.GgufReader;
 import dev.localllm.model.JllmfileParser;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
@@ -75,23 +76,21 @@ public class Main {
             System.out.println("No models registered. Use 'add' or 'create' to register one.");
             return;
         }
-        System.out.printf("%-25s %-8s %-10s %-9s %s%n", "NAME", "FORMAT", "SIZE", "STATUS", "PATH");
-        System.out.println("-".repeat(90));
+        System.out.printf("%-25s %-10s %-8s %-10s %-9s %s%n", "NAME", "QUANT", "PARAMS", "SIZE", "STATUS", "PATH");
+        System.out.println("-".repeat(100));
         long totalBytes = 0;
         int missingCount = 0;
         for (ModelConfig m : models) {
             boolean exists = Files.exists(Paths.get(m.getPath()));
             String status = exists ? "ok" : "missing";
-            System.out.printf("%-25s %-8s %-10s %-9s %s%n",
-                m.getName(),
-                m.getFormat() != null ? m.getFormat() : "-",
-                formatSize(m.getSizeBytes()),
-                status,
-                m.getPath());
+            String quant  = m.getGgufQuantization()   != null ? m.getGgufQuantization()             : "-";
+            String params = m.getGgufParameterCount() != null ? fmtParamCount(m.getGgufParameterCount()) : "-";
+            System.out.printf("%-25s %-10s %-8s %-10s %-9s %s%n",
+                m.getName(), quant, params, formatSize(m.getSizeBytes()), status, m.getPath());
             if (exists) totalBytes += m.getSizeBytes();
             else        missingCount++;
         }
-        System.out.println("-".repeat(90));
+        System.out.println("-".repeat(100));
         System.out.printf("%d model(s)  %s total on disk", models.size(), formatSize(totalBytes));
         if (missingCount > 0) System.out.printf("  (%d file(s) missing — run 'storage' for details)", missingCount);
         System.out.println();
@@ -145,9 +144,11 @@ public class Main {
         model.setFormat(format);
         model.setSizeBytes(Files.size(Paths.get(path)));
         model.setAddedAt(Instant.now().toString());
+        readGgufMetadata(model, path);
 
         registry.add(model);
         System.out.println("Registered '" + name + "' (" + formatSize(model.getSizeBytes()) + ")");
+        printGgufSummary(model);
         if (binary == null) System.out.println("Warning: llama.cpp binary not found. Use --binary.");
     }
 
@@ -213,9 +214,11 @@ public class Main {
         } else if (model.getBinary() == null) {
             model.setBinary(detectLlamaBinary());
         }
+        readGgufMetadata(model, model.getPath());
 
         registry.add(model);
         System.out.println("Created '" + name + "' (" + formatSize(model.getSizeBytes()) + ")");
+        printGgufSummary(model);
         printModelfileParams(model);
     }
 
@@ -245,6 +248,7 @@ public class Main {
         String  prevSystem  = model.getSystemPrompt();
         String  prevPath    = model.getPath();
         String  prevBinary  = model.getBinary();
+        boolean ggufRefreshed = false;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -275,10 +279,15 @@ public class Main {
                         }
                         model.setPath(p);
                         model.setSizeBytes(Files.size(Paths.get(p)));
+                        readGgufMetadata(model, p);
                     }
                     break;
                 case "--binary":
                     if (i + 1 < args.length) model.setBinary(args[++i]);
+                    break;
+                case "--refresh-gguf":
+                    readGgufMetadata(model, model.getPath());
+                    ggufRefreshed = true;
                     break;
                 case "--unset":
                     if (i + 1 < args.length) {
@@ -303,14 +312,14 @@ public class Main {
             }
         }
 
-        boolean changed =
-                !objEq(prevTemp,    model.getTemperature())  ||
-                !objEq(prevPredict, model.getNumPredict())   ||
-                !objEq(prevCtx,     model.getNumCtx())       ||
-                !objEq(prevThreads, model.getNumThreads())   ||
-                !objEq(prevSystem,  model.getSystemPrompt()) ||
-                !objEq(prevPath,    model.getPath())         ||
-                !objEq(prevBinary,  model.getBinary());
+        boolean changed = ggufRefreshed
+                || !objEq(prevTemp,    model.getTemperature())
+                || !objEq(prevPredict, model.getNumPredict())
+                || !objEq(prevCtx,     model.getNumCtx())
+                || !objEq(prevThreads, model.getNumThreads())
+                || !objEq(prevSystem,  model.getSystemPrompt())
+                || !objEq(prevPath,    model.getPath())
+                || !objEq(prevBinary,  model.getBinary());
 
         if (!changed) {
             System.out.println("No changes — configuration already matches the given values.");
@@ -326,6 +335,7 @@ public class Main {
         printParamDiff("system",      prevSystem,  model.getSystemPrompt());
         printParamDiff("path",        prevPath,    model.getPath());
         printParamDiff("binary",      prevBinary,  model.getBinary());
+        if (ggufRefreshed) printGgufSummary(model);
     }
 
     private static void cmdRemove(String[] args) throws Exception {
@@ -513,6 +523,21 @@ public class Main {
         System.out.println("Binary:   " + (m.getBinary()  != null ? m.getBinary()  : "(not set)"));
         System.out.println("Size:     " + formatSize(m.getSizeBytes()));
         System.out.println("Added:    " + (m.getAddedAt() != null ? m.getAddedAt() : "-"));
+
+        // GGUF metadata section (only shown when at least one field is present)
+        boolean hasGguf = m.getGgufArchitecture() != null || m.getGgufQuantization() != null
+                       || m.getGgufParameterCount() != null || m.getGgufContextLength() != null;
+        if (hasGguf) {
+            System.out.println();
+            System.out.println("GGUF Metadata:");
+            if (m.getGgufArchitecture()   != null) System.out.println("  Architecture  : " + m.getGgufArchitecture());
+            if (m.getGgufQuantization()   != null) System.out.println("  Quantization  : " + m.getGgufQuantization());
+            if (m.getGgufParameterCount() != null) System.out.println("  Parameters    : " + fmtParamCount(m.getGgufParameterCount()));
+            if (m.getGgufContextLength()  != null) System.out.println("  Context length: " + m.getGgufContextLength());
+            if (m.getGgufBlockCount()     != null) System.out.println("  Layers        : " + m.getGgufBlockCount());
+            if (m.getGgufEmbeddingLength()!= null) System.out.println("  Embedding dim : " + m.getGgufEmbeddingLength());
+        }
+
         printModelfileParams(m);
     }
 
@@ -723,8 +748,10 @@ public class Main {
             model.setFormat("gguf");
             model.setSizeBytes(Files.size(dest));
             model.setAddedAt(Instant.now().toString());
+            readGgufMetadata(model, dest.toString());
             registry.add(model);
             System.out.println("Registered: " + name);
+            printGgufSummary(model);
             System.out.println("Run with : jllm run " + name);
         }
     }
@@ -940,6 +967,46 @@ public class Main {
         }
     }
 
+    /**
+     * Read GGUF header metadata from {@code path} and populate the corresponding
+     * fields on {@code model}. Silently no-ops on any error (format mismatch,
+     * truncated file, etc.) so that registration never fails due to metadata parsing.
+     */
+    private static void readGgufMetadata(ModelConfig model, String path) {
+        try {
+            GgufReader.GgufMetadata m = GgufReader.read(Paths.get(path));
+            model.setGgufArchitecture(m.architecture);
+            model.setGgufQuantization(m.quantization);
+            model.setGgufParameterCount(m.parameterCount);
+            model.setGgufContextLength(m.contextLength);
+            model.setGgufBlockCount(m.blockCount);
+            model.setGgufEmbeddingLength(m.embeddingLength);
+        } catch (Exception e) {
+            System.out.println("  (GGUF metadata: " + e.getMessage() + ")");
+        }
+    }
+
+    /** Print a one-line summary of extracted GGUF metadata. */
+    private static void printGgufSummary(ModelConfig m) {
+        boolean any = m.getGgufArchitecture() != null || m.getGgufQuantization() != null
+                   || m.getGgufParameterCount() != null || m.getGgufContextLength() != null;
+        if (!any) return;
+        StringBuilder sb = new StringBuilder("  GGUF:");
+        if (m.getGgufArchitecture()   != null) sb.append("  arch=").append(m.getGgufArchitecture());
+        if (m.getGgufQuantization()   != null) sb.append("  quant=").append(m.getGgufQuantization());
+        if (m.getGgufParameterCount() != null) sb.append("  params=").append(fmtParamCount(m.getGgufParameterCount()));
+        if (m.getGgufContextLength()  != null) sb.append("  ctx=").append(m.getGgufContextLength());
+        System.out.println(sb);
+    }
+
+    private static String fmtParamCount(long p) {
+        if (p >= 1_000_000_000_000L) return String.format("%.2fT", p / 1e12);
+        if (p >= 1_000_000_000L)     return String.format("%.2fB", p / 1e9);
+        if (p >= 1_000_000L)         return String.format("%.1fM", p / 1e6);
+        if (p >= 1_000L)             return String.format("%.1fK", p / 1e3);
+        return Long.toString(p);
+    }
+
     private static void printUpdateUsage() {
         System.out.println("Usage: jllm update <name> [options]");
         System.out.println();
@@ -953,8 +1020,9 @@ public class Main {
         System.out.println("  --threads <int>          Set CPU thread count (num_threads)");
         System.out.println("  --system <text>          Set system prompt");
         System.out.println("  --no-system              Clear system prompt");
-        System.out.println("  --path <path>            Update GGUF file path (also recalculates size)");
+        System.out.println("  --path <path>            Update GGUF file path (also recalculates size and refreshes metadata)");
         System.out.println("  --binary <path>          Update llama.cpp binary path");
+        System.out.println("  --refresh-gguf           Re-read GGUF metadata from the current file");
         System.out.println("  --unset <param>          Reset a parameter to the runtime default (null)");
         System.out.println("                           Params: temperature | max-tokens | ctx | threads | system");
         System.out.println();

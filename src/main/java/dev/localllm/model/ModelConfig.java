@@ -21,6 +21,14 @@ public class ModelConfig {
     private Integer numThreads;
     private String  systemPrompt;
 
+    // GGUF header metadata (populated by GgufReader at add/create/pull time; null if unavailable)
+    private String  ggufArchitecture;
+    private String  ggufQuantization;
+    private Long    ggufParameterCount;
+    private Integer ggufContextLength;
+    private Integer ggufBlockCount;
+    private Integer ggufEmbeddingLength;
+
     public String getName()  { return name; }
     public void setName(String name) { this.name = name; }
 
@@ -53,4 +61,22 @@ public class ModelConfig {
 
     public String getSystemPrompt() { return systemPrompt; }
     public void setSystemPrompt(String systemPrompt) { this.systemPrompt = systemPrompt; }
+
+    public String  getGgufArchitecture()   { return ggufArchitecture; }
+    public void    setGgufArchitecture(String v)   { this.ggufArchitecture   = v; }
+
+    public String  getGgufQuantization()   { return ggufQuantization; }
+    public void    setGgufQuantization(String v)   { this.ggufQuantization   = v; }
+
+    public Long    getGgufParameterCount() { return ggufParameterCount; }
+    public void    setGgufParameterCount(Long v)   { this.ggufParameterCount = v; }
+
+    public Integer getGgufContextLength()  { return ggufContextLength; }
+    public void    setGgufContextLength(Integer v) { this.ggufContextLength  = v; }
+
+    public Integer getGgufBlockCount()     { return ggufBlockCount; }
+    public void    setGgufBlockCount(Integer v)    { this.ggufBlockCount     = v; }
+
+    public Integer getGgufEmbeddingLength(){ return ggufEmbeddingLength; }
+    public void    setGgufEmbeddingLength(Integer v){ this.ggufEmbeddingLength = v; }
 }
