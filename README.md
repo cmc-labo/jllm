@@ -68,8 +68,9 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `rag list` | List all RAG collections with chunk counts |
 | `rag search <collection> <query>` | Test retrieval (shows top chunks and BM25 scores) |
 | `rag rm <collection>` | Delete a RAG collection and its index |
+| `verify [<name>]` | Verify SHA-256 checksum(s) against stored values |
 | `show <name> [--yaml]` | Print the model's config (Modelfile or Jllmfile format) |
-| `info <name>` | Show model details |
+| `info <name>` | Show model details (includes SHA-256 and GGUF metadata) |
 | `plugins` | List all loaded plugin tools and interceptors |
 | `version` | Show jllm version, runtime, and dependency info |
 
@@ -124,14 +125,21 @@ jllm add phi3:mini --path ~/models/phi3-mini-q4.gguf --binary /usr/local/bin/lla
 | `--format <fmt>` | Model format (default: `gguf`) |
 | `--managed` | Copy the file into `~/.local-llm/models/` (managed storage) before registering |
 
-At registration time, the GGUF binary header is automatically read to extract model metadata. This is printed immediately and stored in the registry:
+At registration time, the GGUF binary header is parsed and a SHA-256 checksum is computed. Both are printed immediately and stored in the registry:
 
 ```
 Registered 'phi3:mini' (2.2 GB)
-  GGUF:  arch=phi3  quant=Q4_K_M  params=3.82B  ctx=4096
+  GGUF:    arch=phi3  quant=Q4_K_M  params=3.82B  ctx=4096
+  SHA-256: a3f2d1c97e8fb5c1...
 ```
 
-The same metadata is available via `jllm info` and visible in the `QUANT` / `PARAMS` columns of `jllm list`. If the GGUF file lacks a particular field (e.g. `general.parameter_count` is absent in some files), that field is shown as `-`.
+The GGUF metadata is visible in the `QUANT` / `PARAMS` columns of `jllm list` and in full detail via `jllm info`. The SHA-256 is used by `jllm verify` to detect file corruption or accidental replacement. If another registered model has the same SHA-256, a duplicate warning is printed:
+
+```
+  Note: same content as 'phi3:mini-backup' already registered
+```
+
+Pass `--no-hash` to skip the checksum computation (useful for very large files when you don't need integrity checking).
 
 ### `create` — Create from a config file
 
@@ -155,6 +163,35 @@ jllm rm phi3:mini --purge      # remove from registry AND delete the file
 ```
 
 `--purge` prints how many bytes were freed.
+
+### `verify` — Check file integrity
+
+```bash
+jllm verify              # verify all registered models
+jllm verify phi3:mini    # verify one model
+```
+
+Computes the SHA-256 of each file and compares it against the value stored at registration time. For large files (> 50 MB) a progress bar is shown during hashing.
+
+```
+Verifying 3 model(s)...
+
+  phi3:mini                    OK           sha256:a3f2d1c97e8fb5c1
+  llama3.2-3b                  MISMATCH     stored:b5e6f7g8...  got:c9d0e1f2...
+  old-model                    MISSING      /home/user/.local-llm/models/old.gguf
+  legacy-model                 NO HASH      run: jllm update legacy-model --refresh-hash
+
+Summary: 1 OK  1 MISMATCH  1 MISSING  1 NO HASH
+```
+
+| Status | Meaning |
+|---|---|
+| `OK` | File matches the stored checksum |
+| `MISMATCH` | File content has changed since registration — possible corruption or accidental replacement |
+| `MISSING` | Registered path no longer exists on disk |
+| `NO HASH` | Model was registered before checksums were supported; run `--refresh-hash` to add one |
+
+Exit code is `1` if any MISMATCH or MISSING is found, `0` otherwise — suitable for use in scripts or CI.
 
 ### `update` — Modify model parameters in place
 

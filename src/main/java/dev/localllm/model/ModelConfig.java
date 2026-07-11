@@ -21,6 +21,9 @@ public class ModelConfig {
     private Integer numThreads;
     private String  systemPrompt;
 
+    // SHA-256 hex digest of the GGUF file (null = not yet computed)
+    private String  sha256;
+
     // GGUF header metadata (populated by GgufReader at add/create/pull time; null if unavailable)
     private String  ggufArchitecture;
     private String  ggufQuantization;
@@ -61,6 +64,9 @@ public class ModelConfig {
 
     public String getSystemPrompt() { return systemPrompt; }
     public void setSystemPrompt(String systemPrompt) { this.systemPrompt = systemPrompt; }
+
+    public String  getSha256()             { return sha256; }
+    public void    setSha256(String v)     { this.sha256 = v; }
 
     public String  getGgufArchitecture()   { return ggufArchitecture; }
     public void    setGgufArchitecture(String v)   { this.ggufArchitecture   = v; }

@@ -15,12 +15,15 @@ import dev.localllm.rag.RagResult;
 import dev.localllm.runner.ModelRunner;
 import dev.localllm.server.ApiServer;
 
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
@@ -59,6 +62,7 @@ public class Main {
             case "storage": cmdStorage();       break;
             case "plugins": cmdPlugins();       break;
             case "update":  cmdUpdate(args);    break;
+            case "verify":  cmdVerify(args);    break;
             case "version": cmdVersion();       break;
             case "pull":    cmdPull(args);      break;
             default:
@@ -98,15 +102,16 @@ public class Main {
 
     private static void cmdAdd(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: jllm add <name> --path <path> [--binary <path>] [--format <fmt>] [--managed]");
+            System.err.println("Usage: jllm add <name> --path <path> [--binary <path>] [--format <fmt>] [--managed] [--no-hash]");
             System.exit(1);
         }
 
-        String name    = args[1];
-        String path    = null;
-        String binary  = null;
-        String format  = "gguf";
+        String  name    = args[1];
+        String  path    = null;
+        String  binary  = null;
+        String  format  = "gguf";
         boolean managed = false;
+        boolean noHash  = false;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -114,6 +119,7 @@ public class Main {
                 case "--binary":  if (i + 1 < args.length) binary = args[++i]; break;
                 case "--format":  if (i + 1 < args.length) format = args[++i]; break;
                 case "--managed": managed = true; break;
+                case "--no-hash": noHash  = true; break;
             }
         }
 
@@ -145,10 +151,13 @@ public class Main {
         model.setSizeBytes(Files.size(Paths.get(path)));
         model.setAddedAt(Instant.now().toString());
         readGgufMetadata(model, path);
+        computeAndSetSha256(model, Paths.get(path), noHash);
+        checkForDuplicates(model.getSha256(), name);
 
         registry.add(model);
         System.out.println("Registered '" + name + "' (" + formatSize(model.getSizeBytes()) + ")");
         printGgufSummary(model);
+        printSha256Summary(model);
         if (binary == null) System.out.println("Warning: llama.cpp binary not found. Use --binary.");
     }
 
@@ -165,15 +174,17 @@ public class Main {
             System.exit(1);
         }
 
-        String name = args[1];
-        String modelfilePath = null;
-        String binary = null;
+        String  name         = args[1];
+        String  modelfilePath = null;
+        String  binary        = null;
+        boolean noHash        = false;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
                 case "-f":
-                case "--file":   if (i + 1 < args.length) modelfilePath = args[++i]; break;
-                case "--binary": if (i + 1 < args.length) binary        = args[++i]; break;
+                case "--file":    if (i + 1 < args.length) modelfilePath = args[++i]; break;
+                case "--binary":  if (i + 1 < args.length) binary        = args[++i]; break;
+                case "--no-hash": noHash = true; break;
             }
         }
 
@@ -215,10 +226,13 @@ public class Main {
             model.setBinary(detectLlamaBinary());
         }
         readGgufMetadata(model, model.getPath());
+        computeAndSetSha256(model, Paths.get(model.getPath()), noHash);
+        checkForDuplicates(model.getSha256(), name);
 
         registry.add(model);
         System.out.println("Created '" + name + "' (" + formatSize(model.getSizeBytes()) + ")");
         printGgufSummary(model);
+        printSha256Summary(model);
         printModelfileParams(model);
     }
 
@@ -280,6 +294,7 @@ public class Main {
                         model.setPath(p);
                         model.setSizeBytes(Files.size(Paths.get(p)));
                         readGgufMetadata(model, p);
+                        computeAndSetSha256(model, Paths.get(p), false);
                     }
                     break;
                 case "--binary":
@@ -288,6 +303,10 @@ public class Main {
                 case "--refresh-gguf":
                     readGgufMetadata(model, model.getPath());
                     ggufRefreshed = true;
+                    break;
+                case "--refresh-hash":
+                    computeAndSetSha256(model, Paths.get(model.getPath()), false);
+                    ggufRefreshed = true; // reuse the "extra change" flag
                     break;
                 case "--unset":
                     if (i + 1 < args.length) {
@@ -335,7 +354,10 @@ public class Main {
         printParamDiff("system",      prevSystem,  model.getSystemPrompt());
         printParamDiff("path",        prevPath,    model.getPath());
         printParamDiff("binary",      prevBinary,  model.getBinary());
-        if (ggufRefreshed) printGgufSummary(model);
+        if (ggufRefreshed) {
+            printGgufSummary(model);
+            printSha256Summary(model);
+        }
     }
 
     private static void cmdRemove(String[] args) throws Exception {
@@ -523,6 +545,7 @@ public class Main {
         System.out.println("Binary:   " + (m.getBinary()  != null ? m.getBinary()  : "(not set)"));
         System.out.println("Size:     " + formatSize(m.getSizeBytes()));
         System.out.println("Added:    " + (m.getAddedAt() != null ? m.getAddedAt() : "-"));
+        System.out.println("SHA-256:  " + (m.getSha256()  != null ? m.getSha256()  : "(not computed — run: jllm update " + m.getName() + " --refresh-hash)"));
 
         // GGUF metadata section (only shown when at least one field is present)
         boolean hasGguf = m.getGgufArchitecture() != null || m.getGgufQuantization() != null
@@ -638,6 +661,7 @@ public class Main {
         String  token      = System.getenv("HF_TOKEN");
         String  binary     = null;
         boolean noRegister = false;
+        boolean noHash     = false;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -646,6 +670,7 @@ public class Main {
                 case "--token":       if (i + 1 < args.length) token  = args[++i]; break;
                 case "--binary":      if (i + 1 < args.length) binary = args[++i]; break;
                 case "--no-register": noRegister = true; break;
+                case "--no-hash":     noHash     = true; break;
                 default:
                     System.err.println("Unknown flag: " + args[i]);
                     printPullUsage(); System.exit(1);
@@ -749,9 +774,12 @@ public class Main {
             model.setSizeBytes(Files.size(dest));
             model.setAddedAt(Instant.now().toString());
             readGgufMetadata(model, dest.toString());
+            computeAndSetSha256(model, dest, noHash);
+            checkForDuplicates(model.getSha256(), name);
             registry.add(model);
             System.out.println("Registered: " + name);
             printGgufSummary(model);
+            printSha256Summary(model);
             System.out.println("Run with : jllm run " + name);
         }
     }
@@ -799,6 +827,7 @@ public class Main {
         System.out.println("                    (can also be set via HF_TOKEN environment variable)");
         System.out.println("  --binary <path>   Path to llama-cli binary (auto-detected if omitted)");
         System.out.println("  --no-register     Download only; do not register in jllm");
+        System.out.println("  --no-hash         Skip SHA-256 checksum computation");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF");
@@ -1007,6 +1036,150 @@ public class Main {
         return Long.toString(p);
     }
 
+    // ── verify ────────────────────────────────────────────────────────────────
+
+    private static void cmdVerify(String[] args) throws Exception {
+        List<ModelConfig> models;
+        if (args.length >= 2) {
+            ModelConfig m = registry.get(args[1]).orElse(null);
+            if (m == null) {
+                System.err.println("Model '" + args[1] + "' not found.");
+                System.exit(1);
+            }
+            models = Collections.singletonList(m);
+        } else {
+            models = registry.list();
+            if (models.isEmpty()) { System.out.println("No models registered."); return; }
+        }
+
+        System.out.println("Verifying " + models.size() + " model(s)...");
+        System.out.println();
+
+        int ok = 0, mismatch = 0, missing = 0, noHash = 0;
+
+        for (ModelConfig m : models) {
+            System.out.printf("  %-28s", m.getName());
+            Path filePath = Paths.get(m.getPath());
+
+            if (!Files.exists(filePath)) {
+                System.out.printf("%-12s %s%n", "MISSING", m.getPath());
+                missing++;
+                continue;
+            }
+            if (m.getSha256() == null) {
+                System.out.printf("%-12s run: jllm update %s --refresh-hash%n", "NO HASH", m.getName());
+                noHash++;
+                continue;
+            }
+            String current;
+            try {
+                current = computeSha256(filePath);
+            } catch (Exception e) {
+                System.out.printf("%-12s %s%n", "ERROR", e.getMessage());
+                mismatch++;
+                continue;
+            }
+            if (current.equals(m.getSha256())) {
+                System.out.printf("%-12s sha256:%s%n", "OK", m.getSha256().substring(0, 16));
+                ok++;
+            } else {
+                System.out.printf("%-12s stored:%s  got:%s%n",
+                        "MISMATCH",
+                        m.getSha256().substring(0, 16),
+                        current.substring(0, 16));
+                mismatch++;
+            }
+        }
+
+        System.out.println();
+        System.out.printf("Summary: %d OK", ok);
+        if (mismatch > 0) System.out.printf("  %d MISMATCH", mismatch);
+        if (missing  > 0) System.out.printf("  %d MISSING",  missing);
+        if (noHash   > 0) System.out.printf("  %d NO HASH",  noHash);
+        System.out.println();
+
+        if (mismatch > 0 || missing > 0) System.exit(1);
+    }
+
+    // ── SHA-256 helpers ───────────────────────────────────────────────────────
+
+    private static final long HASH_PROGRESS_THRESHOLD = 50L * 1024 * 1024; // 50 MB
+
+    /**
+     * Compute the SHA-256 hex digest of a file.
+     * Shows an inline progress bar for files larger than {@link #HASH_PROGRESS_THRESHOLD}.
+     */
+    private static String computeSha256(Path path) throws Exception {
+        long size    = Files.size(path);
+        boolean prog = size > HASH_PROGRESS_THRESHOLD;
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        byte[] buf   = new byte[64 * 1024];
+        long   done  = 0;
+        long   startMs = System.currentTimeMillis();
+
+        try (InputStream in = Files.newInputStream(path)) {
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                md.update(buf, 0, n);
+                done += n;
+                if (prog) printHashProgress(done, size, startMs);
+            }
+        }
+        if (prog) {
+            // Overwrite progress line with completion
+            long elapsed = Math.max(1, System.currentTimeMillis() - startMs);
+            System.out.printf("\r  SHA-256: computing...  done in %.1f s%s%n",
+                    elapsed / 1000.0, " ".repeat(20));
+        }
+
+        StringBuilder sb = new StringBuilder(64);
+        for (byte b : md.digest()) sb.append(String.format("%02x", b));
+        return sb.toString();
+    }
+
+    private static void printHashProgress(long done, long total, long startMs) {
+        long elapsed = Math.max(1, System.currentTimeMillis() - startMs);
+        double bps   = done * 1000.0 / elapsed;
+        int pct      = (int)(done * 100 / total);
+        int width    = 20;
+        int filled   = (int)(done * width / total);
+        System.out.printf("\r  SHA-256: [%s%s] %3d%%  %s/s          ",
+                "█".repeat(filled), "░".repeat(width - filled), pct, formatSize((long) bps));
+        System.out.flush();
+    }
+
+    /**
+     * Compute and store the SHA-256 hash on {@code model}.
+     * Silently no-ops if {@code noHash} is true.
+     */
+    private static void computeAndSetSha256(ModelConfig model, Path path, boolean noHash) {
+        if (noHash) return;
+        try {
+            model.setSha256(computeSha256(path));
+        } catch (Exception e) {
+            System.out.println("  (SHA-256: " + e.getMessage() + ")");
+        }
+    }
+
+    /**
+     * Warn if any already-registered model shares the same SHA-256 as {@code sha256},
+     * excluding the model named {@code exceptName} (the one being added/updated).
+     */
+    private static void checkForDuplicates(String sha256, String exceptName) {
+        if (sha256 == null) return;
+        for (ModelConfig m : registry.list()) {
+            if (sha256.equals(m.getSha256()) && !exceptName.equals(m.getName())) {
+                System.out.printf("  Note: same content as '%s' already registered%n", m.getName());
+            }
+        }
+    }
+
+    /** Print the stored SHA-256 (first 16 hex chars) as a one-liner. */
+    private static void printSha256Summary(ModelConfig m) {
+        if (m.getSha256() == null) return;
+        System.out.println("  SHA-256: " + m.getSha256().substring(0, 16) + "...");
+    }
+
     private static void printUpdateUsage() {
         System.out.println("Usage: jllm update <name> [options]");
         System.out.println();
@@ -1023,6 +1196,7 @@ public class Main {
         System.out.println("  --path <path>            Update GGUF file path (also recalculates size and refreshes metadata)");
         System.out.println("  --binary <path>          Update llama.cpp binary path");
         System.out.println("  --refresh-gguf           Re-read GGUF metadata from the current file");
+        System.out.println("  --refresh-hash           Recompute and store SHA-256 checksum");
         System.out.println("  --unset <param>          Reset a parameter to the runtime default (null)");
         System.out.println("                           Params: temperature | max-tokens | ctx | threads | system");
         System.out.println();
@@ -1129,6 +1303,7 @@ public class Main {
         System.out.println("       [--branch <ref>]                   HuggingFace branch or commit (default: main)");
         System.out.println("       [--token <token>]                  HF access token (or set HF_TOKEN env var)");
         System.out.println("       [--no-register]                    Download only, skip registration");
+        System.out.println("  verify [<name>]                         Verify SHA-256 checksum(s): OK / MISMATCH / MISSING / NO HASH");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");
         System.out.println("  version                                 Show jllm version, runtime, and dependency info");
         System.out.println();
