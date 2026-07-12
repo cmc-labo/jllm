@@ -104,6 +104,7 @@ jllm pull meta-llama/Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_
 - A `.part` temp file is used during transfer and renamed on completion — a failed download leaves only the `.part` file, which is automatically cleaned up on retry.
 - If the destination file already exists the download is skipped.
 - Progress is shown live: `1.23 GB / 2.04 GB  [████████░░░░]  60%  18 MB/s  ETA 44s`
+- **Split models** — when the downloaded file matches the `model-NNNNN-of-MMMMM.gguf` pattern, jllm automatically downloads all remaining shards before registering. In the file-listing step, only the first shard is shown (the rest are implied), with a note on how many shards will be fetched.
 
 After pulling, run directly:
 ```bash
@@ -141,6 +142,18 @@ The GGUF metadata is visible in the `QUANT` / `PARAMS` columns of `jllm list` an
 
 Pass `--no-hash` to skip the checksum computation (useful for very large files when you don't need integrity checking).
 
+**Split GGUF models** — if the path points to any shard of a split model (e.g. `model-00001-of-00004.gguf`), jllm detects the naming pattern, resolves all sibling shards, registers the primary shard as the path (which llama.cpp uses to load the whole model), and records all shard paths internally:
+
+```
+$ jllm add llama70b --path ~/models/llama-00001-of-00004.gguf
+  Split GGUF: 4 shards
+Registered 'llama70b' (38.2 GB)
+  GGUF:  arch=llama  quant=Q4_K_M  params=70.55B  ctx=4096
+  SHA-256: a3f2d1c97e8fb5c1...
+```
+
+Giving a non-first shard redirects automatically to shard 1. Missing sibling files emit a warning but do not fail registration. Use `jllm info llama70b` to see the per-shard breakdown.
+
 ### `create` — Create from a config file
 
 ```bash
@@ -174,14 +187,15 @@ jllm verify phi3:mini    # verify one model
 Computes the SHA-256 of each file and compares it against the value stored at registration time. For large files (> 50 MB) a progress bar is shown during hashing.
 
 ```
-Verifying 3 model(s)...
+Verifying 4 model(s)...
 
   phi3:mini                    OK           sha256:a3f2d1c97e8fb5c1
+  llama70b                     OK           sha256:e9e274fffd44685a (4 shards)
   llama3.2-3b                  MISMATCH     stored:b5e6f7g8...  got:c9d0e1f2...
   old-model                    MISSING      /home/user/.local-llm/models/old.gguf
   legacy-model                 NO HASH      run: jllm update legacy-model --refresh-hash
 
-Summary: 1 OK  1 MISMATCH  1 MISSING  1 NO HASH
+Summary: 2 OK  1 MISMATCH  1 MISSING  1 NO HASH
 ```
 
 | Status | Meaning |
@@ -622,13 +636,17 @@ Unknown keys are silently ignored for forward compatibility.
 ### `jllm list` — disk status at a glance
 
 ```
-NAME                      FORMAT   SIZE       STATUS    PATH
-------------------------------------------------------------------------------------------
-phi3:mini                 gguf     2.4 GB     ok        /home/user/.local-llm/models/phi3.gguf
-old-model                 gguf     4.1 GB     missing   /mnt/external/old.gguf
-------------------------------------------------------------------------------------------
-2 model(s)  2.4 GB total on disk  (1 file(s) missing — run 'storage' for details)
+NAME                      QUANT      PARAMS   SHARDS  SIZE       STATUS    PATH
+-----------------------------------------------------------------------------------------------------------
+phi3:mini                 Q4_K_M     3.82B    -       2.4 GB     ok        /home/user/.local-llm/models/phi3.gguf
+llama70b                  Q4_K_M     70.55B   4       38.2 GB    ok        /home/user/.local-llm/models/llama-00001-of-00004.gguf
+old-model                 -          -        -       4.1 GB     missing   /mnt/external/old.gguf
+-----------------------------------------------------------------------------------------------------------
+3 model(s)  40.6 GB total on disk  (1 file(s) missing — run 'storage' for details)
 ```
+
+The `SHARDS` column shows `-` for single-file models or the shard count for split models.
+
 
 `STATUS` can be:
 - `ok` — file exists on disk
@@ -1141,8 +1159,9 @@ local-llm-env/
     ├── Main.java                         # CLI entry point (all sub-commands)
     ├── Version.java                      # Compile-time version constants for all bundled deps
     ├── model/
-    │   ├── ModelConfig.java              # Model POJO (path, parameters, system prompt, GGUF metadata)
+    │   ├── ModelConfig.java              # Model POJO (path, shards, parameters, system prompt, GGUF metadata, sha256)
     │   ├── GgufReader.java               # GGUF binary header parser (KV section only; no tensor data)
+    │   ├── SplitGguf.java                # Split GGUF detection (3 naming patterns) and shard enumeration
     │   ├── Modelfile.java                # Modelfile parser and serializer (Ollama-compatible)
     │   ├── JllmfileParser.java           # Jllmfile parser and serializer (YAML format)
     │   └── ModelRegistry.java            # Persists registry to ~/.local-llm/models.json

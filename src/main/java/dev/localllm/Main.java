@@ -5,6 +5,7 @@ import dev.localllm.model.JllmfileParser;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
+import dev.localllm.model.SplitGguf;
 import dev.localllm.jni.LlamaModel;
 import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
@@ -23,9 +24,11 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.stream.Collectors;
 
 public class Main {
 
@@ -80,8 +83,9 @@ public class Main {
             System.out.println("No models registered. Use 'add' or 'create' to register one.");
             return;
         }
-        System.out.printf("%-25s %-10s %-8s %-10s %-9s %s%n", "NAME", "QUANT", "PARAMS", "SIZE", "STATUS", "PATH");
-        System.out.println("-".repeat(100));
+        System.out.printf("%-25s %-10s %-8s %-7s %-10s %-9s %s%n",
+                "NAME", "QUANT", "PARAMS", "SHARDS", "SIZE", "STATUS", "PATH");
+        System.out.println("-".repeat(107));
         long totalBytes = 0;
         int missingCount = 0;
         for (ModelConfig m : models) {
@@ -89,12 +93,13 @@ public class Main {
             String status = exists ? "ok" : "missing";
             String quant  = m.getGgufQuantization()   != null ? m.getGgufQuantization()             : "-";
             String params = m.getGgufParameterCount() != null ? fmtParamCount(m.getGgufParameterCount()) : "-";
-            System.out.printf("%-25s %-10s %-8s %-10s %-9s %s%n",
-                m.getName(), quant, params, formatSize(m.getSizeBytes()), status, m.getPath());
+            String shards = m.isSplit() ? String.valueOf(m.getShards().size()) : "-";
+            System.out.printf("%-25s %-10s %-8s %-7s %-10s %-9s %s%n",
+                m.getName(), quant, params, shards, formatSize(m.getSizeBytes()), status, m.getPath());
             if (exists) totalBytes += m.getSizeBytes();
             else        missingCount++;
         }
-        System.out.println("-".repeat(100));
+        System.out.println("-".repeat(107));
         System.out.printf("%d model(s)  %s total on disk", models.size(), formatSize(totalBytes));
         if (missingCount > 0) System.out.printf("  (%d file(s) missing — run 'storage' for details)", missingCount);
         System.out.println();
@@ -145,13 +150,12 @@ public class Main {
 
         ModelConfig model = new ModelConfig();
         model.setName(name);
-        model.setPath(path);
         model.setBinary(binary);
         model.setFormat(format);
-        model.setSizeBytes(Files.size(Paths.get(path)));
         model.setAddedAt(Instant.now().toString());
-        readGgufMetadata(model, path);
-        computeAndSetSha256(model, Paths.get(path), noHash);
+        applyShardInfo(model, path);
+        readGgufMetadata(model, model.getPath());
+        computeAndSetSha256(model, noHash);
         checkForDuplicates(model.getSha256(), name);
 
         registry.add(model);
@@ -219,14 +223,14 @@ public class Main {
             System.exit(1);
         }
 
-        model.setSizeBytes(Files.size(Paths.get(model.getPath())));
+        applyShardInfo(model, model.getPath());
         if (binary != null) {
             model.setBinary(binary);
         } else if (model.getBinary() == null) {
             model.setBinary(detectLlamaBinary());
         }
         readGgufMetadata(model, model.getPath());
-        computeAndSetSha256(model, Paths.get(model.getPath()), noHash);
+        computeAndSetSha256(model, noHash);
         checkForDuplicates(model.getSha256(), name);
 
         registry.add(model);
@@ -291,10 +295,9 @@ public class Main {
                             System.err.println("File not found: " + p);
                             System.exit(1);
                         }
-                        model.setPath(p);
-                        model.setSizeBytes(Files.size(Paths.get(p)));
-                        readGgufMetadata(model, p);
-                        computeAndSetSha256(model, Paths.get(p), false);
+                        applyShardInfo(model, p);
+                        readGgufMetadata(model, model.getPath());
+                        computeAndSetSha256(model, false);
                     }
                     break;
                 case "--binary":
@@ -305,7 +308,7 @@ public class Main {
                     ggufRefreshed = true;
                     break;
                 case "--refresh-hash":
-                    computeAndSetSha256(model, Paths.get(model.getPath()), false);
+                    computeAndSetSha256(model, false);
                     ggufRefreshed = true; // reuse the "extra change" flag
                     break;
                 case "--unset":
@@ -378,13 +381,21 @@ public class Main {
         System.out.println("Removed '" + name + "' from registry.");
 
         if (purge) {
-            Path filePath = Paths.get(model.getPath());
-            if (Files.exists(filePath)) {
-                Files.delete(filePath);
-                System.out.println("Deleted file: " + filePath + " (" + formatSize(model.getSizeBytes()) + " freed)");
-            } else {
-                System.out.println("File not found on disk (already deleted): " + filePath);
+            List<String> toDelete = model.isSplit()
+                    ? model.getShards() : Collections.singletonList(model.getPath());
+            long freed = 0;
+            for (String s : toDelete) {
+                Path p = Paths.get(s);
+                if (Files.exists(p)) {
+                    long sz = Files.size(p);
+                    Files.delete(p);
+                    freed += sz;
+                    System.out.println("Deleted: " + p);
+                } else {
+                    System.out.println("Not found (already deleted): " + p);
+                }
             }
+            if (freed > 0) System.out.println("Freed: " + formatSize(freed));
         }
     }
 
@@ -481,6 +492,7 @@ public class Main {
         ModelConfig c = new ModelConfig();
         c.setName(src.getName());
         c.setPath(src.getPath());
+        c.setShards(src.getShards());
         c.setBinary(src.getBinary());
         c.setFormat(src.getFormat());
         c.setSizeBytes(src.getSizeBytes());
@@ -542,10 +554,25 @@ public class Main {
         System.out.println("Name:     " + m.getName());
         System.out.println("Format:   " + (m.getFormat()  != null ? m.getFormat()  : "-"));
         System.out.println("Path:     " + m.getPath());
+        if (m.isSplit()) {
+            System.out.println("Shards:   " + m.getShards().size() + " (split model)");
+        }
         System.out.println("Binary:   " + (m.getBinary()  != null ? m.getBinary()  : "(not set)"));
-        System.out.println("Size:     " + formatSize(m.getSizeBytes()));
+        System.out.println("Size:     " + formatSize(m.getSizeBytes()) + (m.isSplit() ? " (total)" : ""));
         System.out.println("Added:    " + (m.getAddedAt() != null ? m.getAddedAt() : "-"));
         System.out.println("SHA-256:  " + (m.getSha256()  != null ? m.getSha256()  : "(not computed — run: jllm update " + m.getName() + " --refresh-hash)"));
+
+        if (m.isSplit()) {
+            System.out.println();
+            System.out.println("Shard files:");
+            for (int i = 0; i < m.getShards().size(); i++) {
+                Path sp     = Paths.get(m.getShards().get(i));
+                boolean ex  = Files.exists(sp);
+                String  sz  = ex ? formatSize(safeFileSize(sp)) : "MISSING";
+                System.out.printf("  [%d/%d]  %-10s  %s%n",
+                        i + 1, m.getShards().size(), sz, sp.getFileName());
+            }
+        }
 
         // GGUF metadata section (only shown when at least one field is present)
         boolean hasGguf = m.getGgufArchitecture() != null || m.getGgufQuantization() != null
@@ -710,15 +737,28 @@ public class Main {
                 System.err.println("No GGUF files found in " + owner + "/" + repo + ".");
                 System.exit(1);
             }
-            if (ggufFiles.size() == 1) {
-                filePath = ggufFiles.get(0).name;
+            // For split models, show only shard-1 and skip the rest (they auto-download).
+            List<HuggingFaceClient.HfFile> displayFiles = new ArrayList<>();
+            for (HuggingFaceClient.HfFile f : ggufFiles) {
+                int[] si = SplitGguf.parseShardInfo(f.name);
+                if (si == null || si[0] == 1) displayFiles.add(f); // single or shard-1
+            }
+            if (displayFiles.size() == 1) {
+                filePath = displayFiles.get(0).name;
                 System.out.println("Found: " + filePath);
                 System.out.println();
             } else {
                 System.out.println("Multiple GGUF files found. Pick one:");
                 System.out.println();
-                for (HuggingFaceClient.HfFile f : ggufFiles) {
-                    System.out.println("  jllm pull " + owner + "/" + repo + "/" + f.name);
+                for (HuggingFaceClient.HfFile f : displayFiles) {
+                    int[] si = SplitGguf.parseShardInfo(f.name);
+                    if (si != null) {
+                        System.out.printf("  jllm pull %s/%s/%s%n", owner, repo, f.name);
+                        System.out.printf("       (%d-shard split model — all %d shards download automatically)%n",
+                                si[1], si[1]);
+                    } else {
+                        System.out.printf("  jllm pull %s/%s/%s%n", owner, repo, f.name);
+                    }
                 }
                 System.out.println();
                 System.exit(0);
@@ -736,28 +776,28 @@ public class Main {
 
         Path dest = ModelRegistry.getManagedModelsDir().resolve(fileName);
 
-        // Download (skip if already present).
-        if (Files.exists(dest)) {
-            System.out.println("Already downloaded: " + dest + "  (" + formatSize(Files.size(dest)) + ")");
-            System.out.println("Skipping download. Delete the file first to force a re-download.");
-            System.out.println();
-        } else {
-            System.out.println("Source : " + owner + "/" + repo + "/" + filePath + "  (branch: " + branch + ")");
-            System.out.println("Dest   : " + dest);
-            System.out.println();
+        // Download primary shard (or single file).
+        downloadShard(hf, owner, repo, filePath, branch, dest);
 
-            long[] startMs = {System.currentTimeMillis()};
-            try {
-                hf.download(owner, repo, filePath, branch, dest, (downloaded, total) ->
-                        printPullProgress(downloaded, total, startMs[0]));
-            } catch (Exception e) {
-                System.out.println();
-                System.err.println("Download failed: " + e.getMessage());
-                System.exit(1);
+        // Detect split and download remaining shards.
+        SplitGguf.Split split = SplitGguf.detect(dest);
+        List<Path> allShards;
+        if (split != null && split.totalShards > 1) {
+            if (!split.isFirstShard()) {
+                System.out.printf("Note: shard %d/%d given; primary shard is: %s%n",
+                        split.shardIndex, split.totalShards, split.first().getFileName());
             }
-            System.out.println(); // end of progress line
-            System.out.println("Complete: " + formatSize(Files.size(dest)));
-            System.out.println();
+            System.out.printf("Split model: %d shards total%n%n", split.totalShards);
+            List<String> remotePaths = SplitGguf.remoteShardPaths(filePath, split.totalShards);
+            for (int i = 0; i < split.totalShards; i++) {
+                Path shardDest = split.shards.get(i);
+                if (shardDest.toAbsolutePath().equals(dest.toAbsolutePath())) continue;
+                System.out.printf("[%d/%d] ", i + 1, split.totalShards);
+                downloadShard(hf, owner, repo, remotePaths.get(i), branch, shardDest);
+            }
+            allShards = split.shards;
+        } else {
+            allShards = Collections.singletonList(dest);
         }
 
         // Register.
@@ -768,13 +808,13 @@ public class Main {
             if (binary == null) binary = detectLlamaBinary();
             ModelConfig model = new ModelConfig();
             model.setName(name);
-            model.setPath(dest.toString());
             model.setBinary(binary);
             model.setFormat("gguf");
-            model.setSizeBytes(Files.size(dest));
             model.setAddedAt(Instant.now().toString());
-            readGgufMetadata(model, dest.toString());
-            computeAndSetSha256(model, dest, noHash);
+            // Use the first shard as the primary path; applyShardInfo will set shards + sizeBytes.
+            applyShardInfo(model, allShards.get(0).toString());
+            readGgufMetadata(model, model.getPath());
+            computeAndSetSha256(model, noHash);
             checkForDuplicates(model.getSha256(), name);
             registry.add(model);
             System.out.println("Registered: " + name);
@@ -782,6 +822,31 @@ public class Main {
             printSha256Summary(model);
             System.out.println("Run with : jllm run " + name);
         }
+    }
+
+    /** Download a single shard from HuggingFace, skipping if already present. */
+    private static void downloadShard(HuggingFaceClient hf,
+            String owner, String repo, String remoteFilePath, String branch, Path dest) throws Exception {
+        if (Files.exists(dest)) {
+            System.out.println("Already downloaded: " + dest.getFileName()
+                    + "  (" + formatSize(Files.size(dest)) + ")");
+            return;
+        }
+        System.out.println("Source : " + owner + "/" + repo + "/" + remoteFilePath
+                + "  (branch: " + branch + ")");
+        System.out.println("Dest   : " + dest);
+        long[] startMs = {System.currentTimeMillis()};
+        try {
+            hf.download(owner, repo, remoteFilePath, branch, dest,
+                    (dl, total) -> printPullProgress(dl, total, startMs[0]));
+        } catch (Exception e) {
+            System.out.println();
+            System.err.println("Download failed: " + e.getMessage());
+            System.exit(1);
+        }
+        System.out.println();
+        System.out.println("Complete: " + formatSize(Files.size(dest)));
+        System.out.println();
     }
 
     private static void printPullProgress(long downloaded, long total, long startMs) {
@@ -997,6 +1062,59 @@ public class Main {
     }
 
     /**
+     * Detect whether {@code rawPath} is part of a split GGUF and update {@code model}
+     * accordingly.  Sets {@code model.path} to the first-shard path, {@code model.shards}
+     * to the full ordered list (or {@code null} for single-file), and {@code model.sizeBytes}
+     * to the total of all existing shard file sizes.
+     */
+    private static void applyShardInfo(ModelConfig model, String rawPath) throws Exception {
+        Path path  = Paths.get(rawPath);
+        SplitGguf.Split split = SplitGguf.detect(path);
+
+        if (split == null || split.totalShards == 1) {
+            model.setPath(rawPath);
+            model.setShards(null);
+            model.setSizeBytes(Files.size(path));
+            return;
+        }
+
+        // Multi-shard model
+        if (!split.isFirstShard()) {
+            System.out.printf("  Note: shard %d/%d given; redirecting to shard 1: %s%n",
+                    split.shardIndex, split.totalShards, split.first().getFileName());
+        }
+        System.out.printf("  Split GGUF: %d shards%n", split.totalShards);
+
+        List<Path> missing = split.shards.stream()
+                .filter(s -> !Files.exists(s))
+                .collect(Collectors.toList());
+        if (!missing.isEmpty()) {
+            System.out.println("  Warning: " + missing.size() + " shard(s) not found:");
+            missing.forEach(s -> System.out.println("    " + s));
+        }
+
+        model.setPath(split.first().toString());
+        model.setShards(split.shards.stream().map(Path::toString).collect(Collectors.toList()));
+
+        long totalSize = split.existingShards().stream()
+                .mapToLong(s -> safeFileSize(s))
+                .sum();
+        model.setSizeBytes(totalSize);
+    }
+
+    /** Returns all shard paths for {@code model}, or a singleton list for single-file models. */
+    private static List<Path> getShardPaths(ModelConfig model) {
+        if (model.isSplit()) {
+            return model.getShards().stream().map(Paths::get).collect(Collectors.toList());
+        }
+        return Collections.singletonList(Paths.get(model.getPath()));
+    }
+
+    private static long safeFileSize(Path p) {
+        try { return Files.size(p); } catch (Exception e) { return 0L; }
+    }
+
+    /**
      * Read GGUF header metadata from {@code path} and populate the corresponding
      * fields on {@code model}. Silently no-ops on any error (format mismatch,
      * truncated file, etc.) so that registration never fails due to metadata parsing.
@@ -1059,10 +1177,19 @@ public class Main {
 
         for (ModelConfig m : models) {
             System.out.printf("  %-28s", m.getName());
-            Path filePath = Paths.get(m.getPath());
+            List<Path> shardPaths = getShardPaths(m);
 
-            if (!Files.exists(filePath)) {
-                System.out.printf("%-12s %s%n", "MISSING", m.getPath());
+            // Check for any missing shard files
+            List<Path> missingPaths = shardPaths.stream()
+                    .filter(p -> !Files.exists(p))
+                    .collect(Collectors.toList());
+            if (!missingPaths.isEmpty()) {
+                if (m.isSplit()) {
+                    System.out.printf("%-12s %d/%d shards missing%n",
+                            "MISSING", missingPaths.size(), shardPaths.size());
+                } else {
+                    System.out.printf("%-12s %s%n", "MISSING", m.getPath());
+                }
                 missing++;
                 continue;
             }
@@ -1073,14 +1200,15 @@ public class Main {
             }
             String current;
             try {
-                current = computeSha256(filePath);
+                current = computeSha256(shardPaths);
             } catch (Exception e) {
                 System.out.printf("%-12s %s%n", "ERROR", e.getMessage());
                 mismatch++;
                 continue;
             }
             if (current.equals(m.getSha256())) {
-                System.out.printf("%-12s sha256:%s%n", "OK", m.getSha256().substring(0, 16));
+                String tag = m.isSplit() ? " (" + shardPaths.size() + " shards)" : "";
+                System.out.printf("%-12s sha256:%s%s%n", "OK", m.getSha256().substring(0, 16), tag);
                 ok++;
             } else {
                 System.out.printf("%-12s stored:%s  got:%s%n",
@@ -1106,27 +1234,28 @@ public class Main {
     private static final long HASH_PROGRESS_THRESHOLD = 50L * 1024 * 1024; // 50 MB
 
     /**
-     * Compute the SHA-256 hex digest of a file.
-     * Shows an inline progress bar for files larger than {@link #HASH_PROGRESS_THRESHOLD}.
+     * Compute SHA-256 over a list of files in order (for split GGUFs, this hashes
+     * the logical concatenation of all shards). Shows a progress bar when total > 50 MB.
      */
-    private static String computeSha256(Path path) throws Exception {
-        long size    = Files.size(path);
-        boolean prog = size > HASH_PROGRESS_THRESHOLD;
+    private static String computeSha256(List<Path> paths) throws Exception {
+        long totalSize = paths.stream().mapToLong(p -> safeFileSize(p)).sum();
+        boolean prog   = totalSize > HASH_PROGRESS_THRESHOLD;
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         byte[] buf   = new byte[64 * 1024];
         long   done  = 0;
         long   startMs = System.currentTimeMillis();
 
-        try (InputStream in = Files.newInputStream(path)) {
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                md.update(buf, 0, n);
-                done += n;
-                if (prog) printHashProgress(done, size, startMs);
+        for (Path path : paths) {
+            try (InputStream in = Files.newInputStream(path)) {
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    md.update(buf, 0, n);
+                    done += n;
+                    if (prog) printHashProgress(done, totalSize, startMs);
+                }
             }
         }
         if (prog) {
-            // Overwrite progress line with completion
             long elapsed = Math.max(1, System.currentTimeMillis() - startMs);
             System.out.printf("\r  SHA-256: computing...  done in %.1f s%s%n",
                     elapsed / 1000.0, " ".repeat(20));
@@ -1135,6 +1264,10 @@ public class Main {
         StringBuilder sb = new StringBuilder(64);
         for (byte b : md.digest()) sb.append(String.format("%02x", b));
         return sb.toString();
+    }
+
+    private static String computeSha256(Path path) throws Exception {
+        return computeSha256(Collections.singletonList(path));
     }
 
     private static void printHashProgress(long done, long total, long startMs) {
@@ -1150,12 +1283,13 @@ public class Main {
 
     /**
      * Compute and store the SHA-256 hash on {@code model}.
+     * For split models, hashes all shards in order (logical concatenation).
      * Silently no-ops if {@code noHash} is true.
      */
-    private static void computeAndSetSha256(ModelConfig model, Path path, boolean noHash) {
+    private static void computeAndSetSha256(ModelConfig model, boolean noHash) {
         if (noHash) return;
         try {
-            model.setSha256(computeSha256(path));
+            model.setSha256(computeSha256(getShardPaths(model)));
         } catch (Exception e) {
             System.out.println("  (SHA-256: " + e.getMessage() + ")");
         }

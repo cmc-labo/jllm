@@ -1,5 +1,7 @@
 package dev.localllm.model;
 
+import java.util.List;
+
 /**
  * Persistent metadata for one registered model. Fields from a Modelfile
  * ({@code temperature}, {@code numPredict}, {@code numCtx}, {@code numThreads},
@@ -13,6 +15,11 @@ public class ModelConfig {
     private String format;
     private long sizeBytes;
     private String addedAt;
+
+    // Split GGUF support: null for single-file models.
+    // For multi-shard models, contains all shard paths in order (including path == shards.get(0)).
+    // sizeBytes is the sum of all shard sizes.
+    private List<String> shards;
 
     // Modelfile parameters (null = not configured, fall back to runtime default)
     private Float   temperature;
@@ -49,6 +56,10 @@ public class ModelConfig {
 
     public String getAddedAt() { return addedAt; }
     public void setAddedAt(String addedAt) { this.addedAt = addedAt; }
+
+    public List<String> getShards()             { return shards; }
+    public void         setShards(List<String> shards) { this.shards = shards; }
+    public boolean      isSplit()               { return shards != null && shards.size() > 1; }
 
     public Float   getTemperature() { return temperature; }
     public void setTemperature(Float temperature) { this.temperature = temperature; }
