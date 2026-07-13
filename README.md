@@ -270,11 +270,13 @@ jllm serve --max-concurrent 4
 | Flag | Description |
 |---|---|
 | `--port <port>` | Port to listen on (default: `11434`) |
-| `--max-concurrent <n>` | Maximum number of inference calls that run simultaneously (default: CPU core count). Extra requests wait until a slot is free. |
+| `--max-concurrent <n>` | Maximum simultaneous inference slots (default: CPU core count). Also controls the number of concurrent sequences in the continuous-batch scheduler. |
 
-On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project Loom) — created instantly, with no OS thread per connection. Requests blocked on the semaphore waiting for an inference slot unmount their virtual thread so no OS thread is wasted. On **Java 11–20**, a cached platform thread pool is used instead; the semaphore still applies.
+On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project Loom) — created instantly, with no OS thread per connection. On **Java 11–20**, a cached platform thread pool is used instead.
 
-**Context pool:** `LlamaContext` instances (which hold the KV cache buffer — typically 400 MB–8 GB depending on model and `num_ctx`) are pooled and reused across requests rather than allocated and freed on every call. The pool holds up to `--max-concurrent` idle contexts per model configuration. Pool hit rate and current idle state are exposed via `GET /api/ps`.
+**Continuous batching (JNI mode):** When the JNI library is available, inference is handled by a `BatchScheduler` per model. Incoming requests are queued and decoded together in a single `llama_decode` call per step — up to `--max-concurrent` sequences at once. This amortises GPU/CPU kernel launch overhead across concurrent users and is the same approach used by llama.cpp's own server. Each sequence gets its own KV-cache slot and sampler chain so outputs are independent. Scheduler metrics (active sequences, pending requests) are exposed via `GET /api/ps`.
+
+**Fallback (no JNI):** If the native library is not available, inference falls back to the `ContextPool` path: `LlamaContext` instances are pooled and reused across requests, one request active per context at a time. The pool holds up to `--max-concurrent` idle contexts per model configuration.
 
 ### `version` — Show environment info
 
@@ -908,10 +910,17 @@ The embedded HTTP server is built on **Undertow** and exposes both an Ollama-com
 
 Each incoming request is dispatched to a dedicated thread:
 
-- **Java 21+** — a **Virtual Thread** (Project Loom). Virtual threads are created instantly (no OS thread per connection), so thousands of concurrent SSE clients or chat sessions cost almost nothing in memory or scheduling overhead. A request blocked waiting for an inference slot (see below) parks the virtual thread rather than holding an OS thread.
+- **Java 21+** — a **Virtual Thread** (Project Loom). Virtual threads are created instantly (no OS thread per connection), so thousands of concurrent SSE clients or chat sessions cost almost nothing in memory or scheduling overhead.
 - **Java 11–20** — a platform thread from a cached thread pool.
 
-Inference is serialized by model (llama.cpp contexts are not reentrant), but bounded by `--max-concurrent` (default: CPU core count). Requests that arrive while all inference slots are busy wait on a semaphore — the virtual thread unmounts; no OS thread is consumed while waiting.
+**Inference dispatch** depends on whether the JNI library is available:
+
+| Path | When | Mechanism |
+|---|---|---|
+| **BatchScheduler** (primary) | JNI library available | Continuous batching — all active sequences decoded in one `llama_decode` call per step |
+| **ContextPool** (fallback) | No JNI library | One request per pooled context; semaphore limits concurrency |
+
+With the `BatchScheduler`, a request's HTTP handler submits tokenised input to the scheduler and blocks on a `BlockingQueue`, reading tokens as they arrive. The scheduler thread runs independently, mixing prefill and decode steps across all queued sequences. Up to `--max-concurrent` sequences are active simultaneously; additional requests wait in a bounded queue.
 
 Streaming behaviour:
 - **Ollama endpoints** stream newline-delimited JSON (`application/x-ndjson`), one object per token.
@@ -924,10 +933,7 @@ All endpoints respond with `Access-Control-Allow-Origin: *` CORS headers so brow
 connect directly. `OPTIONS` preflight requests are handled automatically.
 
 The model named in `model` is loaded into memory on first use and kept resident for subsequent
-requests (no reload-per-request). `LlamaContext` instances (which own the KV cache buffer) are
-**pooled and reused** across requests via a `ContextPool` rather than allocated fresh on every call.
-The pool holds up to `--max-concurrent` idle contexts per model configuration; pool metrics are
-exposed at `GET /api/ps`.
+requests (no reload-per-request).
 
 **Prompt interceptors** loaded from `~/.local-llm/plugins/` are applied to every prompt in all
 handlers — both Ollama and OpenAI endpoints.
@@ -1038,7 +1044,7 @@ curl http://localhost:11434/api/tags
 }
 ```
 
-### `GET /api/ps` — Context pool status
+### `GET /api/ps` — Inference status
 
 ```bash
 curl http://localhost:11434/api/ps
@@ -1046,27 +1052,34 @@ curl http://localhost:11434/api/ps
 
 ```json
 {
-  "models": [
+  "models": [],
+  "batch_schedulers": [
     {
       "name": "phi3:mini",
-      "idle_contexts": 1,
-      "num_ctx": 4096,
-      "num_threads": 4,
-      "size_bytes": 2394025984
+      "active_sequences": 2,
+      "pending_requests": 1,
+      "num_ctx": "4096",
+      "num_threads": "4"
     }
   ],
   "pool_stats": {
-    "hits": 47,
-    "misses": 2,
-    "hit_rate_pct": 95.9,
-    "total_idle": 1,
-    "distinct_keys": 1,
+    "hits": 0,
+    "misses": 0,
+    "hit_rate": "0.0%",
+    "total_idle": 0,
     "evictions": 0
   }
 }
 ```
 
-`idle_contexts` is the number of `LlamaContext` instances currently sitting idle in the pool, ready to serve the next request without a KV cache allocation. `hit_rate_pct` is the fraction of requests that received a pooled context rather than allocating a new one.
+In JNI mode:
+- **`batch_schedulers`** — one entry per active `(model, num_ctx, num_threads)` tuple. `active_sequences` is the number of requests currently being decoded; `pending_requests` is the number queued waiting for a slot.
+- **`models`** — empty (ContextPool is not used in JNI mode).
+
+In fallback (no JNI) mode:
+- **`models`** — one entry per idle context; `idle_contexts` is the number of pooled contexts ready to reuse.
+- **`batch_schedulers`** — empty.
+- **`pool_stats`** — `hit_rate` is the fraction of requests that reused a pooled context.
 
 ### `POST /api/generate` — Generate text
 
@@ -1181,14 +1194,16 @@ local-llm-env/
     │   └── ModelRunner.java              # Interactive REPL: JNI streaming + tool calling loop + RAG
     ├── server/
     │   ├── ApiServer.java                # Undertow HTTP server: Ollama + OpenAI APIs + RAG
-    │   └── ContextPool.java              # LlamaContext pool: KV cache reuse across requests
+    │   ├── BatchScheduler.java           # Continuous-batch scheduler: multi-seq llama_decode loop
+    │   └── ContextPool.java              # LlamaContext pool: KV cache reuse (JNI fallback)
     └── jni/
-        ├── LlamaNative.java              # Raw native method declarations
+        ├── LlamaNative.java              # Raw native method declarations (single + batch primitives)
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
         ├── NativeLogBridge.java          # Forwards native log output into SLF4J
         ├── NativeCrashException.java     # Thrown when a native fatal signal is caught
-        ├── LlamaModel.java               # High-level model wrapper (AutoCloseable)
-        ├── LlamaContext.java             # High-level inference context wrapper
+        ├── LlamaModel.java               # High-level model wrapper (AutoCloseable); createContext + createBatchContext
+        ├── BatchContext.java             # Multi-sequence context wrapper used by BatchScheduler
+        ├── LlamaContext.java             # Single-sequence inference context wrapper (ContextPool fallback)
         └── LlamaDemo.java                # Minimal smoke-test CLI
 ```
 
@@ -1348,10 +1363,11 @@ Verified end-to-end against [`ggml-org/models/tinyllamas/stories260K.gguf`](http
 
 | Class | Purpose |
 |---|---|
-| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API (model/context lifecycle, tokenize, detokenize, EOG check, streaming generate, log callback registration) |
-| `LlamaModel` | `AutoCloseable` wrapper; loads a GGUF file, exposes tokenization helpers and `createContext()` |
-| `LlamaContext` | `AutoCloseable` wrapper bound to a model; exposes `generate()`, `generateStreaming()` (push callback), and `generateTokens()` (pull-based `TokenStream`) |
-| `LlamaContext.TokenStream` | `Iterator<String>` + `Iterable<String>` + `AutoCloseable` view over one `generateTokens()` call; runs generation on a background thread and hands off tokens one at a time, so a caller can pull (and stop pulling) at its own pace |
+| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API — single-sequence `generate`, multi-sequence batch primitives (`newBatchContext`, `batchDecode`, `samplerCreate/Sample/Free`, `kvSeqRm`), plus model/context lifecycle, tokenization, log callback |
+| `LlamaModel` | `AutoCloseable` wrapper; loads a GGUF file, exposes tokenization helpers, `createContext()`, and `createBatchContext()` |
+| `BatchContext` | `AutoCloseable` multi-sequence context; wraps the six batch JNI primitives used by `BatchScheduler` |
+| `LlamaContext` | `AutoCloseable` single-sequence context; exposes `generate()`, `generateStreaming()` (push callback), and `generateTokens()` (pull-based `TokenStream`) — used by the ContextPool fallback |
+| `LlamaContext.TokenStream` | `Iterator<String>` + `Iterable<String>` + `AutoCloseable` view over one `generateTokens()` call; runs generation on a background thread and hands off tokens one at a time |
 | `NativeLogBridge` | Forwards llama.cpp/ggml native log output into SLF4J (see [Native log output](#native-log-output)) |
 | `NativeCrashException` | Thrown when native code hits a fatal signal that was intercepted instead of killing the JVM (see [Crash containment](#crash-containment)) |
 
@@ -1374,9 +1390,11 @@ early `break` (e.g. a client disconnecting mid-response in `ApiServer`) can't le
 
 ### Concurrency
 
-A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. `LlamaContext` guards every native call with a lock, so calls on a *shared* context are serialized rather than racing — but for actual parallel generation across users, create one `LlamaContext` per concurrent request via `LlamaModel.createContext()`. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design).
+A single `llama_context` is not reentrant: concurrent `llama_decode` calls against it corrupt its KV cache / sampler state. The underlying `LlamaModel` is safe to share across contexts (this matches llama.cpp's own multi-slot server design).
 
-`ApiServer` follows this pattern: one shared `LlamaModel` per registered model (loaded lazily on first request) plus a `ContextPool` that pools `LlamaContext` instances keyed by `(modelName, nCtx, nThreads)`. After each request finishes, its context is returned to the pool rather than closed, so the next request for the same model configuration pays no KV cache allocation or deallocation cost — only the first request per key allocates a new context. Reuse is safe because `generateTokens()` always decodes the full prompt token sequence starting at KV cache position 0, overwriting any entries from the previous request. The pool is bounded by `--max-concurrent` idle contexts per key; extras are closed immediately on return. Pool metrics (`hits`, `misses`, `hit_rate`, `idle`) are exposed at `GET /api/ps`.
+`ApiServer` creates one shared `LlamaModel` per registered model (loaded lazily on first request). Concurrent requests are handled by the **`BatchScheduler`** — a dedicated background thread that drives a multi-sequence `BatchContext`. Each sequence gets its own `seq_id` (0 … maxSeqs−1) in the shared KV cache; llama.cpp filters attention by `seq_id`, so independent sequences do not interfere even when they occupy the same position indices. Up to `--max-concurrent` sequences are decoded together in each `llama_decode` call.
+
+When the JNI library is unavailable, `ApiServer` falls back to the **`ContextPool`**: multiple `LlamaContext` instances are pooled and reused across requests, one request active per context at a time. Pool metrics are exposed at `GET /api/ps`.
 
 ### Crash containment
 
