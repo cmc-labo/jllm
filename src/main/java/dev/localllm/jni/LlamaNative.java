@@ -67,4 +67,57 @@ public final class LlamaNative {
     public interface TokenCallback {
         boolean onToken(String piece);
     }
+
+    // ── Continuous-batch primitives ───────────────────────────────────────────
+
+    /**
+     * Like {@link #newContext} but sets {@code n_seq_max = nSeqMax}, allowing the
+     * context to hold KV cache entries for multiple simultaneous sequences.
+     * The total KV cache size is {@code nCtx} tokens shared across all sequences.
+     */
+    public static native long newBatchContext(long model, int nCtx, int nThreads, int nSeqMax);
+
+    /**
+     * Evaluate a batch of tokens.
+     *
+     * <p>Each element {@code i} describes one token: sequence {@code seqIds[i]},
+     * token id {@code tokens[i]}, at KV-cache position {@code positions[i]}.
+     * {@code logits} (needed for sampling) are requested for the last token of each
+     * consecutive run sharing the same {@code seqId}.
+     *
+     * @return 0 on success, non-zero on failure
+     */
+    public static native int batchDecode(long ctx,
+                                         int[] seqIds, int[] tokens, int[] positions,
+                                         int nTokens);
+
+    /**
+     * Create an independent sampler chain (temperature → distribution sampler).
+     * Each active sequence must own its own sampler so their internal RNG states
+     * do not interfere.
+     *
+     * @return opaque sampler handle; must be freed with {@link #samplerFree}
+     */
+    public static native long samplerCreate(float temperature);
+
+    /**
+     * Sample the next token for the sequence whose logits are at position
+     * {@code batchIdx} in the most recent {@link #batchDecode} output.
+     * Pass {@code -1} to sample from the last logits in the batch (useful during
+     * single-sequence prefill).
+     *
+     * @return sampled token id
+     */
+    public static native int samplerSample(long ctx, long sampler, int batchIdx);
+
+    /** Free a sampler handle created by {@link #samplerCreate}. */
+    public static native void samplerFree(long sampler);
+
+    /**
+     * Remove KV-cache entries for sequence {@code seqId} in the position range
+     * {@code [posFrom, posTo)}.  Pass {@code posTo = -1} to remove all positions
+     * from {@code posFrom} to the end.  Used to reclaim KV slots when a sequence
+     * finishes.
+     */
+    public static native void kvSeqRm(long ctx, int seqId, int posFrom, int posTo);
 }

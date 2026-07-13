@@ -80,6 +80,21 @@ public final class LlamaModel implements AutoCloseable {
         return new LlamaContext(this, ctxHandle);
     }
 
+    /**
+     * Create a multi-sequence batch context. The total KV cache holds
+     * {@code nCtxPerSeq * maxSeqs} tokens, split across {@code maxSeqs}
+     * independent sequence slots.
+     */
+    public BatchContext createBatchContext(int nCtxPerSeq, int nThreads, int maxSeqs) {
+        checkOpen();
+        long h = LlamaNative.newBatchContext(handle, nCtxPerSeq * maxSeqs, nThreads, maxSeqs);
+        if (h == 0) {
+            throw new IllegalStateException(
+                "Failed to create batch context (nCtxPerSeq=" + nCtxPerSeq + ", maxSeqs=" + maxSeqs + ")");
+        }
+        return new BatchContext(h);
+    }
+
     public int[] tokenize(String text, boolean addSpecial, boolean parseSpecial) {
         checkOpen();
         return LlamaNative.tokenize(handle, text, addSpecial, parseSpecial);

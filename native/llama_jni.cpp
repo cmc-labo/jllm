@@ -781,3 +781,179 @@ JNIEXPORT jint JNICALL Java_dev_localllm_jni_LlamaNative_generate
         return 0;
     }
 }
+
+// ── Continuous-batch primitives ──────────────────────────────────────────────
+
+JNIEXPORT jlong JNICALL Java_dev_localllm_jni_LlamaNative_newBatchContext
+  (JNIEnv* env, jclass, jlong modelHandle, jint nCtx, jint nThreads, jint nSeqMax) {
+    LLAMA_JNI_GUARD_BEGIN(env, 0);
+
+    if (modelHandle == 0) {
+        throwIllegalArgument(env, "model handle must not be 0");
+        return 0;
+    }
+    if (nCtx <= 0 || nThreads <= 0 || nSeqMax <= 0) {
+        throwIllegalArgument(env, "nCtx, nThreads and nSeqMax must all be positive");
+        return 0;
+    }
+
+    try {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx           = static_cast<uint32_t>(nCtx);
+        params.n_batch         = static_cast<uint32_t>(nCtx);
+        params.n_ubatch        = static_cast<uint32_t>(nCtx);
+        params.n_seq_max       = static_cast<uint32_t>(nSeqMax);
+        params.n_threads       = nThreads;
+        params.n_threads_batch = nThreads;
+
+        llama_context* ctx = llama_init_from_model(asModel(modelHandle), params);
+        return reinterpret_cast<jlong>(ctx);
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("newBatchContext failed: ") + e.what());
+        return 0;
+    } catch (...) {
+        throwIllegalState(env, "newBatchContext failed: unknown native exception");
+        return 0;
+    }
+}
+
+JNIEXPORT jint JNICALL Java_dev_localllm_jni_LlamaNative_batchDecode
+  (JNIEnv* env, jclass, jlong ctxHandle,
+   jintArray jSeqIds, jintArray jTokens, jintArray jPositions, jint nTokens) {
+    LLAMA_JNI_GUARD_BEGIN(env, -1);
+
+    if (ctxHandle == 0) {
+        throwIllegalArgument(env, "context handle must not be 0");
+        return -1;
+    }
+    if (jSeqIds == nullptr || jTokens == nullptr || jPositions == nullptr) {
+        throwIllegalArgument(env, "seqIds, tokens and positions must not be null");
+        return -1;
+    }
+    if (nTokens <= 0) {
+        throwIllegalArgument(env, "nTokens must be positive");
+        return -1;
+    }
+
+    try {
+        JIntArrayElems seqIds(env, jSeqIds);
+        JIntArrayElems tokens(env, jTokens);
+        JIntArrayElems positions(env, jPositions);
+        if (!seqIds.get() || !tokens.get() || !positions.get()) {
+            throwOutOfMemory(env, "failed to pin batch arrays");
+            return -1;
+        }
+
+        // Allocate batch; each token belongs to exactly one sequence (n_seq_max=1 per slot).
+        llama_batch batch = llama_batch_init(nTokens, 0, 1);
+        for (int i = 0; i < nTokens; i++) {
+            llama_seq_id sid = static_cast<llama_seq_id>(seqIds.get()[i]);
+            // Request logits for the last token of each contiguous same-seqId run.
+            bool lastForSeq = (i == nTokens - 1)
+                           || (seqIds.get()[i] != seqIds.get()[i + 1]);
+            int j = batch.n_tokens;
+            batch.token   [j] = static_cast<llama_token>(tokens.get()[i]);
+            batch.pos     [j] = static_cast<llama_pos>(positions.get()[i]);
+            batch.n_seq_id[j] = 1;
+            batch.seq_id  [j][0] = sid;
+            batch.logits  [j] = lastForSeq ? 1 : 0;
+            batch.n_tokens++;
+        }
+
+        int ret = llama_decode(asContext(ctxHandle), batch);
+        llama_batch_free(batch);
+        return ret;
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("batchDecode failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        throwIllegalState(env, "batchDecode failed: unknown native exception");
+        return -1;
+    }
+}
+
+JNIEXPORT jlong JNICALL Java_dev_localllm_jni_LlamaNative_samplerCreate
+  (JNIEnv* env, jclass, jfloat temperature) {
+    LLAMA_JNI_GUARD_BEGIN(env, 0);
+    try {
+        llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+        llama_sampler* smpl = llama_sampler_chain_init(sparams);
+        if (smpl == nullptr) {
+            throwIllegalState(env, "samplerCreate failed: could not allocate sampler chain");
+            return 0;
+        }
+        if (temperature <= 0.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+        } else {
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+        }
+        return reinterpret_cast<jlong>(smpl);
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("samplerCreate failed: ") + e.what());
+        return 0;
+    } catch (...) {
+        throwIllegalState(env, "samplerCreate failed: unknown native exception");
+        return 0;
+    }
+}
+
+JNIEXPORT jint JNICALL Java_dev_localllm_jni_LlamaNative_samplerSample
+  (JNIEnv* env, jclass, jlong ctxHandle, jlong samplerHandle, jint batchIdx) {
+    LLAMA_JNI_GUARD_BEGIN(env, -1);
+    if (ctxHandle == 0) {
+        throwIllegalArgument(env, "context handle must not be 0");
+        return -1;
+    }
+    if (samplerHandle == 0) {
+        throwIllegalArgument(env, "sampler handle must not be 0");
+        return -1;
+    }
+    try {
+        llama_sampler* smpl = reinterpret_cast<llama_sampler*>(samplerHandle);
+        llama_token tok = llama_sampler_sample(smpl, asContext(ctxHandle), batchIdx);
+        return static_cast<jint>(tok);
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("samplerSample failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        throwIllegalState(env, "samplerSample failed: unknown native exception");
+        return -1;
+    }
+}
+
+JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_samplerFree
+  (JNIEnv* env, jclass, jlong samplerHandle) {
+    LLAMA_JNI_GUARD_BEGIN(env, );
+    try {
+        if (samplerHandle != 0) {
+            llama_sampler_free(reinterpret_cast<llama_sampler*>(samplerHandle));
+        }
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("samplerFree failed: ") + e.what());
+    } catch (...) {
+        throwIllegalState(env, "samplerFree failed: unknown native exception");
+    }
+}
+
+JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_kvSeqRm
+  (JNIEnv* env, jclass, jlong ctxHandle, jint seqId, jint posFrom, jint posTo) {
+    LLAMA_JNI_GUARD_BEGIN(env, );
+    if (ctxHandle == 0) {
+        throwIllegalArgument(env, "context handle must not be 0");
+        return;
+    }
+    try {
+        llama_memory_t mem = llama_get_memory(asContext(ctxHandle));
+        if (mem != nullptr) {
+            llama_memory_seq_rm(mem,
+                                static_cast<llama_seq_id>(seqId),
+                                static_cast<llama_pos>(posFrom),
+                                static_cast<llama_pos>(posTo));
+        }
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("kvSeqRm failed: ") + e.what());
+    } catch (...) {
+        throwIllegalState(env, "kvSeqRm failed: unknown native exception");
+    }
+}

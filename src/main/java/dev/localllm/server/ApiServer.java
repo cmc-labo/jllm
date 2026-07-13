@@ -6,6 +6,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import dev.localllm.jni.LlamaContext;
 import dev.localllm.jni.LlamaModel;
+import dev.localllm.server.BatchScheduler;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
@@ -110,6 +111,8 @@ public class ApiServer {
     private final ContextPool contextPool;
 
     private final Map<String, LlamaModel> loadedModels = new ConcurrentHashMap<>();
+    // One BatchScheduler per unique (model, nCtx, nThreads) configuration.
+    private final Map<String, BatchScheduler> batchSchedulers = new ConcurrentHashMap<>();
     private final Gson prettyGson;
     private final Gson compactGson;
 
@@ -301,8 +304,22 @@ public class ApiServer {
             if (cfg != null) entry.put("size_bytes", cfg.getSizeBytes());
             models.add(entry);
         }
+
+        List<Map<String, Object>> schedulers = new ArrayList<>();
+        batchSchedulers.forEach((key, sched) -> {
+            String[] parts = key.split("\\|", 3);
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name",              parts[0]);
+            entry.put("active_sequences",  sched.activeSequences());
+            entry.put("pending_requests",  sched.pendingRequests());
+            entry.put("num_ctx",           parts.length > 1 ? parts[1] : "?");
+            entry.put("num_threads",       parts.length > 2 ? parts[2] : "?");
+            schedulers.add(entry);
+        });
+
         sendJson(ex, 200, map(
             "models",    models,
+            "batch_schedulers", schedulers,
             "pool_stats", map(
                 "hits",      ps.hits,
                 "misses",    ps.misses,
@@ -368,28 +385,23 @@ public class ApiServer {
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
-        inferenceSemaphore.acquire();
-        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
-                if (opts.stream) {
-                    beginNdjson(ex);
-                    try (OutputStream os = ex.getOutputStream()) {
-                        for (String piece : ts) writeNdjson(os, ollamaGenerateChunk(modelName, piece, false));
-                        writeNdjson(os, ollamaGenerateChunk(modelName, "", true));
-                    }
-                } else {
-                    StringBuilder sb = new StringBuilder();
-                    for (String t : ts) sb.append(t);
-                    sendJson(ex, 200, ollamaGenerateChunk(modelName, sb.toString(), true));
+            if (opts.stream) {
+                beginNdjson(ex);
+                try (OutputStream os = ex.getOutputStream()) {
+                    streamTokens(model, modelName, effectivePrompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                        piece -> writeNdjson(os, ollamaGenerateChunk(modelName, piece, false)));
+                    writeNdjson(os, ollamaGenerateChunk(modelName, "", true));
                 }
+            } else {
+                StringBuilder sb = new StringBuilder();
+                streamTokens(model, modelName, effectivePrompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                    sb::append);
+                sendJson(ex, 200, ollamaGenerateChunk(modelName, sb.toString(), true));
             }
         } catch (Exception e) {
             LOG.error("generate failed for '{}'", modelName, e);
             if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
-        } finally {
-            contextPool.release(modelName, nCtx, nThreads, ctx);
-            inferenceSemaphore.release();
         }
     }
 
@@ -413,28 +425,23 @@ public class ApiServer {
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
 
-        inferenceSemaphore.acquire();
-        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
-                if (opts.stream) {
-                    beginNdjson(ex);
-                    try (OutputStream os = ex.getOutputStream()) {
-                        for (String piece : ts) writeNdjson(os, ollamaChatChunk(modelName, piece, false));
-                        writeNdjson(os, ollamaChatChunk(modelName, "", true));
-                    }
-                } else {
-                    StringBuilder sb = new StringBuilder();
-                    for (String t : ts) sb.append(t);
-                    sendJson(ex, 200, ollamaChatChunk(modelName, sb.toString(), true));
+            if (opts.stream) {
+                beginNdjson(ex);
+                try (OutputStream os = ex.getOutputStream()) {
+                    streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                        piece -> writeNdjson(os, ollamaChatChunk(modelName, piece, false)));
+                    writeNdjson(os, ollamaChatChunk(modelName, "", true));
                 }
+            } else {
+                StringBuilder sb = new StringBuilder();
+                streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                    sb::append);
+                sendJson(ex, 200, ollamaChatChunk(modelName, sb.toString(), true));
             }
         } catch (Exception e) {
             LOG.error("chat failed for '{}'", modelName, e);
             if (!ex.isResponseStarted()) sendError(ex, 500, "chat failed: " + e.getMessage());
-        } finally {
-            contextPool.release(modelName, nCtx, nThreads, ctx);
-            inferenceSemaphore.release();
         }
     }
 
@@ -473,31 +480,26 @@ public class ApiServer {
         String id    = "chatcmpl-" + shortUuid();
         long created = Instant.now().getEpochSecond();
 
-        inferenceSemaphore.acquire();
-        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext.TokenStream ts = ctx.generateTokens(prompt, opts.numPredict, opts.temperature)) {
-                if (opts.stream) {
-                    beginSse(ex);
-                    try (OutputStream os = ex.getOutputStream()) {
-                        writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
-                        for (String piece : ts) writeSse(os, openAiChatChunk(id, modelName, created, piece, null, null));
-                        writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
-                        os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                        os.flush();
-                    }
-                } else {
-                    StringBuilder sb = new StringBuilder();
-                    for (String t : ts) sb.append(t);
-                    sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
+            if (opts.stream) {
+                beginSse(ex);
+                try (OutputStream os = ex.getOutputStream()) {
+                    writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
+                    streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                        piece -> writeSse(os, openAiChatChunk(id, modelName, created, piece, null, null)));
+                    writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
+                    os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                    os.flush();
                 }
+            } else {
+                StringBuilder sb = new StringBuilder();
+                streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                    sb::append);
+                sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
             }
         } catch (Exception e) {
             LOG.error("v1/chat/completions failed for '{}'", modelName, e);
             if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
-        } finally {
-            contextPool.release(modelName, nCtx, nThreads, ctx);
-            inferenceSemaphore.release();
         }
     }
 
@@ -521,30 +523,25 @@ public class ApiServer {
         String id    = "cmpl-" + shortUuid();
         long created = Instant.now().getEpochSecond();
 
-        inferenceSemaphore.acquire();
-        LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
         try {
-            try (LlamaContext.TokenStream ts = ctx.generateTokens(effectivePrompt, opts.numPredict, opts.temperature)) {
-                if (opts.stream) {
-                    beginSse(ex);
-                    try (OutputStream os = ex.getOutputStream()) {
-                        for (String piece : ts) writeSse(os, openAiCompletionChunk(id, modelName, created, piece, null));
-                        writeSse(os, openAiCompletionChunk(id, modelName, created, "", "stop"));
-                        os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                        os.flush();
-                    }
-                } else {
-                    StringBuilder sb = new StringBuilder();
-                    for (String t : ts) sb.append(t);
-                    sendJson(ex, 200, openAiCompletionResponse(id, modelName, created, sb.toString()));
+            if (opts.stream) {
+                beginSse(ex);
+                try (OutputStream os = ex.getOutputStream()) {
+                    streamTokens(model, modelName, effectivePrompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                        piece -> writeSse(os, openAiCompletionChunk(id, modelName, created, piece, null)));
+                    writeSse(os, openAiCompletionChunk(id, modelName, created, "", "stop"));
+                    os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                    os.flush();
                 }
+            } else {
+                StringBuilder sb = new StringBuilder();
+                streamTokens(model, modelName, effectivePrompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                    sb::append);
+                sendJson(ex, 200, openAiCompletionResponse(id, modelName, created, sb.toString()));
             }
         } catch (Exception e) {
             LOG.error("v1/completions failed for '{}'", modelName, e);
             if (!ex.isResponseStarted()) sendError(ex, 500, "generation failed: " + e.getMessage());
-        } finally {
-            contextPool.release(modelName, nCtx, nThreads, ctx);
-            inferenceSemaphore.release();
         }
     }
 
@@ -640,6 +637,51 @@ public class ApiServer {
             sendError(ex, 500, "failed to load model: " + e.getMessage());
             return null;
         }
+    }
+
+    // ── Inference dispatch ────────────────────────────────────────────────────
+
+    @FunctionalInterface
+    private interface TokenSink {
+        void accept(String piece) throws Exception;
+    }
+
+    /**
+     * Stream tokens for {@code prompt} into {@code sink}, using the
+     * {@link BatchScheduler} when the JNI library is available and falling
+     * back to the {@link ContextPool} path otherwise.
+     */
+    private void streamTokens(LlamaModel model, String modelName,
+                               String prompt, int nPredict, float temperature,
+                               int nCtx, int nThreads,
+                               TokenSink sink) throws Exception {
+        if (LlamaModel.isNativeLibraryAvailable()) {
+            BatchScheduler sched = getOrCreateScheduler(model, modelName, nCtx, nThreads);
+            int[] tokens = model.tokenize(prompt, true, true);
+            BatchScheduler.Sequence seq = sched.submit(tokens, nPredict, temperature);
+            String piece;
+            while ((piece = seq.nextPiece()) != null) {
+                sink.accept(piece);
+            }
+        } else {
+            inferenceSemaphore.acquire();
+            LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
+            try {
+                try (LlamaContext.TokenStream ts = ctx.generateTokens(prompt, nPredict, temperature)) {
+                    for (String piece : ts) sink.accept(piece);
+                }
+            } finally {
+                contextPool.release(modelName, nCtx, nThreads, ctx);
+                inferenceSemaphore.release();
+            }
+        }
+    }
+
+    private BatchScheduler getOrCreateScheduler(LlamaModel model, String modelName,
+                                                 int nCtx, int nThreads) {
+        String key = modelName + "|" + nCtx + "|" + nThreads;
+        return batchSchedulers.computeIfAbsent(key,
+            k -> new BatchScheduler(model, nCtx, nThreads, maxConcurrent));
     }
 
     // ── Prompt helpers ────────────────────────────────────────────────────────
