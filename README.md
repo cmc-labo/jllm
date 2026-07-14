@@ -1,5 +1,7 @@
 # local-llm / jllm
 
+![Demo](docs/demo.gif)
+
 A lightweight Java tool for managing and running local LLMs — similar to Ollama but minimal by design.
 
 Models are registered by pointing to a local GGUF file. The registry is stored in `~/.local-llm/models.json`. Large GGUF files can be imported into a managed storage directory (`~/.local-llm/models/`) and removed cleanly from there with a single command.
