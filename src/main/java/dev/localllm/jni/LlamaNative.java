@@ -120,4 +120,19 @@ public final class LlamaNative {
      * finishes.
      */
     public static native void kvSeqRm(long ctx, int seqId, int posFrom, int posTo);
+
+    // ── On-the-fly quantization ───────────────────────────────────────────────
+
+    /**
+     * Quantize a GGUF file in-place (i.e. read {@code inputPath}, write the
+     * quantized result to {@code outputPath}).  The model is loaded and
+     * unloaded internally; no model handle is needed.
+     *
+     * @param inputPath   path to the source GGUF (F16/BF16/F32 recommended)
+     * @param outputPath  path to write the quantized GGUF (must not equal inputPath)
+     * @param ftypeInt    {@code llama_ftype} integer value (see {@link QuantizeType#ftypeId})
+     * @param nThreads    number of CPU threads to use; ≤0 = hardware concurrency
+     * @return 0 on success, non-zero on failure
+     */
+    public static native int quantize(String inputPath, String outputPath, int ftypeInt, int nThreads);
 }

@@ -7,6 +7,8 @@ import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
 import dev.localllm.model.SplitGguf;
 import dev.localllm.jni.LlamaModel;
+import dev.localllm.jni.LlamaNative;
+import dev.localllm.jni.QuantizeType;
 import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
 import dev.localllm.plugin.PromptInterceptor;
@@ -107,24 +109,42 @@ public class Main {
 
     private static void cmdAdd(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: jllm add <name> --path <path> [--binary <path>] [--format <fmt>] [--managed] [--no-hash]");
+            System.err.println("Usage: jllm add <name> --path <path> [--binary <path>] [--format <fmt>]");
+            System.err.println("                       [--managed] [--no-hash]");
+            System.err.println("                       [--quantize <type>] [--quantize-output <path>] [--threads <int>]");
             System.exit(1);
         }
 
-        String  name    = args[1];
-        String  path    = null;
-        String  binary  = null;
-        String  format  = "gguf";
-        boolean managed = false;
-        boolean noHash  = false;
+        String       name         = args[1];
+        String       path         = null;
+        String       binary       = null;
+        String       format       = "gguf";
+        boolean      managed      = false;
+        boolean      noHash       = false;
+        QuantizeType quantizeType = null;
+        String       quantizeOut  = null;
+        int          threads      = 0;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
-                case "--path":    if (i + 1 < args.length) path   = args[++i]; break;
-                case "--binary":  if (i + 1 < args.length) binary = args[++i]; break;
-                case "--format":  if (i + 1 < args.length) format = args[++i]; break;
-                case "--managed": managed = true; break;
-                case "--no-hash": noHash  = true; break;
+                case "--path":             if (i + 1 < args.length) path        = args[++i]; break;
+                case "--binary":           if (i + 1 < args.length) binary      = args[++i]; break;
+                case "--format":           if (i + 1 < args.length) format      = args[++i]; break;
+                case "--quantize":
+                    if (i + 1 < args.length) {
+                        quantizeType = QuantizeType.fromString(args[++i]);
+                        if (quantizeType == null) {
+                            System.err.println("Unknown quantize type: " + args[i]);
+                            System.err.println("Valid types: " + QuantizeType.validNames());
+                            System.exit(1);
+                        }
+                    }
+                    break;
+                case "--quantize-output":  if (i + 1 < args.length) quantizeOut = args[++i]; break;
+                case "--threads":
+                case "--num-threads":      if (i + 1 < args.length) threads     = Integer.parseInt(args[++i]); break;
+                case "--managed":          managed = true; break;
+                case "--no-hash":          noHash  = true; break;
             }
         }
 
@@ -134,7 +154,10 @@ public class Main {
             System.exit(1);
         }
 
-        if (managed) {
+        if (quantizeType != null) {
+            path = runQuantize(path, quantizeType, quantizeOut, managed, threads);
+            managed = false; // already placed in final location
+        } else if (managed) {
             Path managedDir = ModelRegistry.getManagedModelsDir();
             Files.createDirectories(managedDir);
             Path dest = managedDir.resolve(Paths.get(path).getFileName());
@@ -682,13 +705,15 @@ public class Main {
     private static void cmdPull(String[] args) throws Exception {
         if (args.length < 2) { printPullUsage(); System.exit(1); }
 
-        String  ref        = args[1];
-        String  name       = null;
-        String  branch     = "main";
-        String  token      = System.getenv("HF_TOKEN");
-        String  binary     = null;
-        boolean noRegister = false;
-        boolean noHash     = false;
+        String       ref          = args[1];
+        String       name         = null;
+        String       branch       = "main";
+        String       token        = System.getenv("HF_TOKEN");
+        String       binary       = null;
+        boolean      noRegister   = false;
+        boolean      noHash       = false;
+        QuantizeType quantizeType = null;
+        int          threads      = 0;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -698,6 +723,18 @@ public class Main {
                 case "--binary":      if (i + 1 < args.length) binary = args[++i]; break;
                 case "--no-register": noRegister = true; break;
                 case "--no-hash":     noHash     = true; break;
+                case "--quantize":
+                    if (i + 1 < args.length) {
+                        quantizeType = QuantizeType.fromString(args[++i]);
+                        if (quantizeType == null) {
+                            System.err.println("Unknown quantize type: " + args[i]);
+                            System.err.println("Valid types: " + QuantizeType.validNames());
+                            System.exit(1);
+                        }
+                    }
+                    break;
+                case "--threads":
+                case "--num-threads": if (i + 1 < args.length) threads = Integer.parseInt(args[++i]); break;
                 default:
                     System.err.println("Unknown flag: " + args[i]);
                     printPullUsage(); System.exit(1);
@@ -800,6 +837,16 @@ public class Main {
             allShards = Collections.singletonList(dest);
         }
 
+        // Quantize before registering (only for single-file models; split GGUF not supported).
+        String primaryPath = allShards.get(0).toString();
+        if (quantizeType != null) {
+            if (allShards.size() > 1) {
+                System.out.println("Warning: --quantize is not supported for split GGUF models; skipping quantization.");
+            } else {
+                primaryPath = runQuantize(primaryPath, quantizeType, null, false, threads);
+            }
+        }
+
         // Register.
         if (!noRegister) {
             if (registry.get(name).isPresent()) {
@@ -811,8 +858,7 @@ public class Main {
             model.setBinary(binary);
             model.setFormat("gguf");
             model.setAddedAt(Instant.now().toString());
-            // Use the first shard as the primary path; applyShardInfo will set shards + sizeBytes.
-            applyShardInfo(model, allShards.get(0).toString());
+            applyShardInfo(model, primaryPath);
             readGgufMetadata(model, model.getPath());
             computeAndSetSha256(model, noHash);
             checkForDuplicates(model.getSha256(), name);
@@ -822,6 +868,67 @@ public class Main {
             printSha256Summary(model);
             System.out.println("Run with : jllm run " + name);
         }
+    }
+
+    /**
+     * Quantize {@code inputPath} using the JNI binding and return the path of the
+     * output file.  The output path is derived as follows (in priority order):
+     * <ol>
+     *   <li>If {@code explicitOutput} is non-null, use it as-is.</li>
+     *   <li>If {@code toManaged} is true, place the output in managed storage.</li>
+     *   <li>Otherwise place it in the same directory as the input, with the
+     *       quantization type appended to the stem.</li>
+     * </ol>
+     */
+    private static String runQuantize(String inputPath, QuantizeType type,
+                                      String explicitOutput, boolean toManaged,
+                                      int threads) throws Exception {
+        if (!LlamaModel.isNativeLibraryAvailable()) {
+            System.err.println("Error: --quantize requires the JNI native library (libllamajni.so).");
+            System.err.println("Build the native library with: bash build.sh (requires CMake + llama.cpp).");
+            System.exit(1);
+        }
+
+        Path input = Paths.get(inputPath).toAbsolutePath();
+        Path output;
+        if (explicitOutput != null) {
+            output = Paths.get(explicitOutput).toAbsolutePath();
+        } else {
+            String stem = input.getFileName().toString();
+            if (stem.toLowerCase(Locale.ROOT).endsWith(".gguf")) {
+                stem = stem.substring(0, stem.length() - 5);
+            }
+            String outName = stem + "-" + type.name + ".gguf";
+            if (toManaged) {
+                Path managedDir = ModelRegistry.getManagedModelsDir();
+                Files.createDirectories(managedDir);
+                output = managedDir.resolve(outName);
+            } else {
+                output = input.getParent().resolve(outName);
+            }
+        }
+
+        if (output.toAbsolutePath().equals(input.toAbsolutePath())) {
+            System.err.println("Error: quantize output path must differ from input path.");
+            System.exit(1);
+        }
+
+        System.out.println("Quantizing " + type.name + "...");
+        System.out.println("  Input  : " + input);
+        System.out.println("  Output : " + output);
+        System.out.flush();
+
+        long startMs = System.currentTimeMillis();
+        int rc = LlamaNative.quantize(input.toString(), output.toString(), type.ftypeId, threads);
+        long elapsed = System.currentTimeMillis() - startMs;
+
+        if (rc != 0 || !Files.exists(output)) {
+            System.err.println("Quantization failed (return code " + rc + ").");
+            System.exit(1);
+        }
+        System.out.printf("Quantization complete in %.1f s  (%s → %s)%n",
+                elapsed / 1000.0, formatSize(Files.size(input)), formatSize(Files.size(output)));
+        return output.toString();
     }
 
     /** Download a single shard from HuggingFace, skipping if already present. */
@@ -900,6 +1007,8 @@ public class Main {
         System.out.println("  jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf");
         System.out.println("  jllm pull bartowski/Phi-3.5-mini-instruct-GGUF/Phi-3.5-mini-instruct-Q4_K_M.gguf --name phi3.5");
         System.out.println("  jllm pull lmstudio-community/Meta-Llama-3-8B-Instruct-GGUF/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf --token hf_...");
+        System.out.println("  jllm pull bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-F16.gguf --quantize Q4_K_M --name llama3.2:3b");
+        System.out.println("       (download F16, quantize to Q4_K_M in-process, register quantized file)");
     }
 
     private static void cmdVersion() {
@@ -1401,6 +1510,9 @@ public class Main {
         System.out.println("             [--binary <path>]            Path to llama.cpp binary");
         System.out.println("             [--format <fmt>]             Model format (default: gguf)");
         System.out.println("             [--managed]                  Copy file into managed storage (~/.local-llm/models/)");
+        System.out.println("             [--quantize <type>]          Quantize before registering (requires JNI; e.g. Q4_K_M)");
+        System.out.println("             [--quantize-output <path>]   Override output path for quantized file");
+        System.out.println("             [--threads <int>]            CPU threads for quantization (default: all)");
         System.out.println("  create <name> -f <file>                 Create a model from a Modelfile or Jllmfile (.yaml/.yml)");
         System.out.println("                [--binary <path>]         Path to llama.cpp binary");
         System.out.println("  rm <name> [--purge]                     Remove a model (--purge also deletes the file)");
@@ -1437,6 +1549,8 @@ public class Main {
         System.out.println("       [--branch <ref>]                   HuggingFace branch or commit (default: main)");
         System.out.println("       [--token <token>]                  HF access token (or set HF_TOKEN env var)");
         System.out.println("       [--no-register]                    Download only, skip registration");
+        System.out.println("       [--quantize <type>]                Quantize after download before registering (e.g. Q4_K_M)");
+        System.out.println("       [--threads <int>]                  CPU threads for quantization (default: all)");
         System.out.println("  verify [<name>]                         Verify SHA-256 checksum(s): OK / MISMATCH / MISSING / NO HASH");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");
         System.out.println("  version                                 Show jllm version, runtime, and dependency info");

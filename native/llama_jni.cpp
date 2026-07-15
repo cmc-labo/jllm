@@ -957,3 +957,33 @@ JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_kvSeqRm
         throwIllegalState(env, "kvSeqRm failed: unknown native exception");
     }
 }
+
+// ── On-the-fly quantization ───────────────────────────────────────────────────
+
+JNIEXPORT jint JNICALL Java_dev_localllm_jni_LlamaNative_quantize
+  (JNIEnv* env, jclass, jstring jinputPath, jstring joutputPath, jint ftypeInt, jint nThreads) {
+    LLAMA_JNI_GUARD_BEGIN(env, -1);
+    if (jinputPath == nullptr || joutputPath == nullptr) {
+        throwIllegalArgument(env, "inputPath and outputPath must not be null");
+        return -1;
+    }
+    JStringUTF inputPath(env, jinputPath);
+    JStringUTF outputPath(env, joutputPath);
+    if (inputPath.get() == nullptr || outputPath.get() == nullptr) {
+        throwIllegalArgument(env, "failed to read path strings");
+        return -1;
+    }
+    try {
+        llama_model_quantize_params params = llama_model_quantize_default_params();
+        params.ftype   = static_cast<llama_ftype>(ftypeInt);
+        params.nthread = (nThreads <= 0) ? 0 : nThreads;
+        uint32_t ret = llama_model_quantize(inputPath.get(), outputPath.get(), &params);
+        return static_cast<jint>(ret);
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("quantize failed: ") + e.what());
+        return -1;
+    } catch (...) {
+        throwIllegalState(env, "quantize failed: unknown native exception");
+        return -1;
+    }
+}
