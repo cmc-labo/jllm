@@ -100,6 +100,8 @@ jllm pull meta-llama/Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_
 | `--token <token>` | HF access token for private or gated models (or set `HF_TOKEN`) |
 | `--binary <path>` | Path to `llama-cli` binary (auto-detected if omitted) |
 | `--no-register` | Download only; skip registry entry |
+| `--quantize <type>` | Quantize the downloaded file before registering (requires JNI; e.g. `Q4_K_M`). Produces a new `.gguf` alongside the original; the quantized file is registered |
+| `--threads <int>` | CPU thread count to use during quantization (default: all cores) |
 
 **Download behaviour:**
 - Files are saved to `~/.local-llm/models/<filename>.gguf` (managed storage).
@@ -127,6 +129,30 @@ jllm add phi3:mini --path ~/models/phi3-mini-q4.gguf --binary /usr/local/bin/lla
 | `--binary <path>` | Path to `llama-cli`. Auto-detected if omitted (used only as subprocess fallback) |
 | `--format <fmt>` | Model format (default: `gguf`) |
 | `--managed` | Copy the file into `~/.local-llm/models/` (managed storage) before registering |
+| `--quantize <type>` | Quantize in-process before registering (requires JNI). Supported types: `Q2_K`, `Q3_K_S/M/L`, `Q4_0`, `Q4_K_S/M`, `Q5_0`, `Q5_K_S/M`, `Q6_K`, `Q8_0`, `F16`, `BF16`. The quantized file is registered; the original is left on disk |
+| `--quantize-output <path>` | Override the output path for the quantized file (default: same directory as input with the type appended to the filename stem, e.g. `phi3-f16-Q4_K_M.gguf`; with `--managed`, placed in `~/.local-llm/models/`) |
+| `--threads <int>` | CPU thread count for quantization (default: all cores) |
+
+**On-the-fly quantization** — if you have a full-precision (F16/BF16/F32) GGUF and want to compress it before registering, pass `--quantize`:
+
+```bash
+# Quantize a downloaded F16 GGUF to Q4_K_M and register the result
+jllm add phi3:mini --path ~/downloads/phi3-f16.gguf --quantize Q4_K_M
+
+# Place the quantized file in managed storage automatically
+jllm add phi3:mini --path ~/downloads/phi3-f16.gguf --quantize Q4_K_M --managed
+
+# Full pipeline: download an F16 from HuggingFace, quantize, register
+jllm pull owner/repo/phi3-f16.gguf --quantize Q4_K_M --name phi3:mini
+```
+
+Progress and size reduction are printed:
+```
+Quantizing Q4_K_M...
+  Input  : /home/user/downloads/phi3-f16.gguf
+  Output : /home/user/downloads/phi3-f16-Q4_K_M.gguf
+Quantization complete in 42.3 s  (7.6 GB → 2.4 GB)
+```
 
 At registration time, the GGUF binary header is parsed and a SHA-256 checksum is computed. Both are printed immediately and stored in the registry:
 
@@ -221,11 +247,18 @@ jllm update phi3:mini --ctx 8192 --threads 8
 jllm update phi3:mini --system "You are a strict JSON generator. Output only valid JSON."
 jllm update phi3:mini --max-tokens 2048
 
+# Offload 35 layers to GPU
+jllm update phi3:mini --gpu-layers 35
+
+# Offload all layers to GPU
+jllm update phi3:mini --gpu-layers -1
+
 # Clear system prompt
 jllm update phi3:mini --no-system
 
 # Reset a parameter to the runtime default (removes it from the stored config)
 jllm update phi3:mini --unset temperature
+jllm update phi3:mini --unset gpu-layers   # revert to CPU-only
 
 # Move the GGUF file — update the registered path and recalculate size
 jllm update phi3:mini --path /new/location/phi3-mini.gguf
@@ -237,12 +270,13 @@ jllm update phi3:mini --path /new/location/phi3-mini.gguf
 | `--max-tokens <int>` | Set max output tokens (`num_predict`) |
 | `--ctx <int>` | Set context window size (`num_ctx`) |
 | `--threads <int>` | Set CPU thread count (`num_threads`) |
+| `--gpu-layers <int>` | Set number of model layers to offload to GPU (`num_gpu_layers`). `0` = CPU only, `-1` = all layers, positive integer = partial offload |
 | `--system <text>` | Set system prompt |
 | `--no-system` | Clear the stored system prompt |
 | `--path <path>` | Update GGUF file path (also recalculates size and re-reads GGUF metadata) |
 | `--binary <path>` | Update the `llama-cli` binary path |
 | `--refresh-gguf` | Re-read GGUF metadata from the current file (useful for models added before this feature existed) |
-| `--unset <param>` | Reset a parameter to `null` (runtime default). Params: `temperature` \| `max-tokens` \| `ctx` \| `threads` \| `system` |
+| `--unset <param>` | Reset a parameter to `null` (runtime default). Params: `temperature` \| `max-tokens` \| `ctx` \| `threads` \| `gpu-layers` \| `system` |
 
 Only the flags you pass are changed; everything else stays the same. Changes are
 shown as a before→after diff:
@@ -550,6 +584,7 @@ All flags below apply to both interactive and non-interactive mode. They overrid
 | `--max-tokens <int>` | Maximum tokens to generate (alias: `--num-predict`) |
 | `--ctx <int>` | Context window size in tokens (alias: `--num-ctx`) |
 | `--threads <int>` | CPU thread count for inference (alias: `--num-threads`) |
+| `--gpu-layers <int>` | GPU layers to offload for this session (`0` = CPU only, `-1` = all; alias: `--num-gpu-layers`) |
 
 Examples:
 
@@ -580,10 +615,11 @@ Every field is optional except `FROM`.
 # My assistant
 FROM /path/to/model.gguf
 
-PARAMETER temperature   0.7
-PARAMETER num_predict   1024
-PARAMETER num_ctx       4096
-PARAMETER num_threads   4
+PARAMETER temperature    0.7
+PARAMETER num_predict    1024
+PARAMETER num_ctx        4096
+PARAMETER num_threads    4
+PARAMETER num_gpu_layers 35
 
 SYSTEM You are a helpful, concise assistant.
 ```
@@ -597,7 +633,16 @@ Always respond in the language the user writes in.
 """
 ```
 
-Supported `PARAMETER` keys: `temperature`, `num_predict`, `num_ctx`, `num_threads`.
+Supported `PARAMETER` keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `temperature` | float | Sampling temperature |
+| `num_predict` | int | Maximum tokens to generate |
+| `num_ctx` | int | Context window size in tokens |
+| `num_threads` | int | CPU thread count |
+| `num_gpu_layers` | int | Layers to offload to GPU (`0` = CPU only, `-1` = all, positive = partial offload) |
+
 Unknown instructions (e.g. `TEMPLATE`, `ADAPTER`) are silently ignored, so Modelfiles
 written for full Ollama can be reused here without parse errors.
 
@@ -620,6 +665,7 @@ parameters:
   num_predict: 1024
   num_ctx: 4096
   num_threads: 4
+  num_gpu_layers: 35
 ```
 
 Multi-line system prompts use YAML block scalars:
@@ -630,7 +676,16 @@ system: |
   Always respond in the language the user writes in.
 ```
 
-Supported `parameters` keys: `temperature`, `num_predict`, `num_ctx`, `num_threads`.
+Supported `parameters` keys:
+
+| Key | Type | Description |
+|---|---|---|
+| `temperature` | float | Sampling temperature |
+| `num_predict` | int | Maximum tokens to generate |
+| `num_ctx` | int | Context window size in tokens |
+| `num_threads` | int | CPU thread count |
+| `num_gpu_layers` | int | Layers to offload to GPU (`0` = CPU only, `-1` = all, positive = partial offload) |
+
 Unknown keys are silently ignored for forward compatibility.
 
 ---
@@ -823,7 +878,10 @@ At inference time, parameters are resolved in this order:
 
 1. `options.*` in the API request body (highest — caller always wins)
 2. `PARAMETER` / `parameters:` values from the model's Modelfile or Jllmfile
-3. Server-wide defaults (`temperature 0.8`, `num_predict 200`, `num_ctx 4096`)
+3. CLI session flags (e.g. `--gpu-layers`, `--temperature`) — override registry values for one invocation only
+4. Server-wide defaults (`temperature 0.8`, `num_predict 200`, `num_ctx 4096`, `num_gpu_layers 0`)
+
+`num_gpu_layers` is applied at model-load time, so it takes effect when the model is first loaded into memory. In `jllm serve`, the model is cached after the first request — changing `num_gpu_layers` in the registry requires restarting the server to take effect.
 
 ---
 
@@ -881,6 +939,18 @@ ANSWER=$(jllm run phi3:mini --prompt "Capital of Japan?" --max-tokens 20)
 
 # Session overrides — temperature, context window, system prompt
 jllm run phi3:mini --temperature 0 --ctx 8192 --system "You are a strict JSON generator."
+
+# Offload all layers to GPU for this session only
+jllm run phi3:mini --gpu-layers -1
+
+# Persist GPU offload in the registry
+jllm update phi3:mini --gpu-layers 35
+
+# On-the-fly quantization: register a Q4_K_M version of an F16 GGUF
+jllm add phi3:mini --path ~/downloads/phi3-f16.gguf --quantize Q4_K_M --managed
+
+# Download F16 from HuggingFace, quantize to Q4_K_M in-process, register
+jllm pull owner/repo/phi3-f16.gguf --quantize Q4_K_M --name phi3:mini
 
 # Start API server on the default port (11434)
 jllm serve
@@ -1199,7 +1269,8 @@ local-llm-env/
     │   ├── BatchScheduler.java           # Continuous-batch scheduler: multi-seq llama_decode loop
     │   └── ContextPool.java              # LlamaContext pool: KV cache reuse (JNI fallback)
     └── jni/
-        ├── LlamaNative.java              # Raw native method declarations (single + batch primitives)
+        ├── LlamaNative.java              # Raw native method declarations (single + batch primitives, quantize)
+        ├── QuantizeType.java             # Enum mapping quantization type names to llama_ftype integer values
         ├── NativeLibraryLoader.java      # Locates and loads libllamajni.so
         ├── NativeLogBridge.java          # Forwards native log output into SLF4J
         ├── NativeCrashException.java     # Thrown when a native fatal signal is caught
@@ -1229,7 +1300,7 @@ local-llm-env/
 
 ## Notes
 
-- The registry file `~/.local-llm/models.json` persists across sessions. All config parameters (`temperature`, `num_predict`, `num_ctx`, `num_threads`, system prompt) are stored as part of each model's entry.
+- The registry file `~/.local-llm/models.json` persists across sessions. All config parameters (`temperature`, `num_predict`, `num_ctx`, `num_threads`, `num_gpu_layers`, system prompt) are stored as part of each model's entry. A `null` value for any parameter means "use the runtime default" — for `num_gpu_layers` the default is `0` (CPU only).
 - The API server is built on [Undertow](https://undertow.io/) (embedded, no servlet container needed). It adds ~3 MB to the fat JAR.
 - On Java 21+, the server uses **Virtual Threads** (Project Loom) for lightweight multi-user concurrency. The source is compiled with `-source 11` for compatibility; virtual thread support is detected and enabled at runtime via reflection. No code changes or flags are needed — run with Java 21+ and virtual threads activate automatically.
 - Chat prompts are formatted using [ChatML](https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md). A model's `SYSTEM` prompt is injected as a `system` turn at the start of every chat — unless the request already includes a `system` role message, in which case the request takes precedence.
@@ -1365,7 +1436,7 @@ Verified end-to-end against [`ggml-org/models/tinyllamas/stories260K.gguf`](http
 
 | Class | Purpose |
 |---|---|
-| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API — single-sequence `generate`, multi-sequence batch primitives (`newBatchContext`, `batchDecode`, `samplerCreate/Sample/Free`, `kvSeqRm`), plus model/context lifecycle, tokenization, log callback |
+| `LlamaNative` | Raw `native` method declarations mirroring llama.cpp's C API — single-sequence `generate`, multi-sequence batch primitives (`newBatchContext`, `batchDecode`, `samplerCreate/Sample/Free`, `kvSeqRm`), on-the-fly `quantize`, plus model/context lifecycle, tokenization, log callback |
 | `LlamaModel` | `AutoCloseable` wrapper; loads a GGUF file, exposes tokenization helpers, `createContext()`, and `createBatchContext()` |
 | `BatchContext` | `AutoCloseable` multi-sequence context; wraps the six batch JNI primitives used by `BatchScheduler` |
 | `LlamaContext` | `AutoCloseable` single-sequence context; exposes `generate()`, `generateStreaming()` (push callback), and `generateTokens()` (pull-based `TokenStream`) — used by the ContextPool fallback |
