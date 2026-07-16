@@ -18,6 +18,7 @@ import java.util.Locale;
  *     num_predict: 1024
  *     num_ctx: 4096
  *     num_threads: 4
+ *     num_gpu_layers: 35
  * </pre>
  *
  * <p>Comments ({@code #}) and blank lines are ignored. Unknown keys are
@@ -132,11 +133,12 @@ public final class JllmfileParser {
         if (val.isEmpty()) return;
         try {
             switch (key) {
-                case "temperature":  config.setTemperature(Float.parseFloat(val));   break;
-                case "num_predict":  config.setNumPredict(Integer.parseInt(val));    break;
-                case "num_ctx":      config.setNumCtx(Integer.parseInt(val));        break;
+                case "temperature":    config.setTemperature(Float.parseFloat(val));   break;
+                case "num_predict":    config.setNumPredict(Integer.parseInt(val));    break;
+                case "num_ctx":        config.setNumCtx(Integer.parseInt(val));        break;
                 case "num_thread":
-                case "num_threads":  config.setNumThreads(Integer.parseInt(val));    break;
+                case "num_threads":    config.setNumThreads(Integer.parseInt(val));    break;
+                case "num_gpu_layers": config.setNumGpuLayers(Integer.parseInt(val));  break;
             }
         } catch (NumberFormatException e) {
             System.err.println("Warning: Jllmfile parameter '" + key
@@ -188,14 +190,16 @@ public final class JllmfileParser {
                 sb.append("system: \"").append(sys.replace("\"", "\\\"")).append("\"\n");
             }
         }
-        boolean hasParam = config.getTemperature() != null || config.getNumPredict() != null
-                        || config.getNumCtx()      != null || config.getNumThreads() != null;
+        boolean hasParam = config.getTemperature()  != null || config.getNumPredict()   != null
+                        || config.getNumCtx()       != null || config.getNumThreads()   != null
+                        || config.getNumGpuLayers() != null;
         if (hasParam) {
             sb.append("parameters:\n");
             if (config.getTemperature()  != null) sb.append("  temperature: ").append(config.getTemperature()).append('\n');
             if (config.getNumPredict()   != null) sb.append("  num_predict: ").append(config.getNumPredict()).append('\n');
             if (config.getNumCtx()       != null) sb.append("  num_ctx: ").append(config.getNumCtx()).append('\n');
             if (config.getNumThreads()   != null) sb.append("  num_threads: ").append(config.getNumThreads()).append('\n');
+            if (config.getNumGpuLayers() != null) sb.append("  num_gpu_layers: ").append(config.getNumGpuLayers()).append('\n');
         }
         return sb.toString();
     }

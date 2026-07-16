@@ -8,10 +8,11 @@ import java.util.Locale;
  * <p>Supported instructions:
  * <pre>
  *   FROM &lt;path&gt;                        Path to a GGUF model file.
- *   PARAMETER temperature 0.8           Sampling temperature (float).
- *   PARAMETER num_predict 512           Max tokens to generate (int).
- *   PARAMETER num_ctx     4096          Context window size (int).
- *   PARAMETER num_threads 4             CPU thread count (int).
+ *   PARAMETER temperature    0.8         Sampling temperature (float).
+ *   PARAMETER num_predict    512         Max tokens to generate (int).
+ *   PARAMETER num_ctx        4096        Context window size (int).
+ *   PARAMETER num_threads    4           CPU thread count (int).
+ *   PARAMETER num_gpu_layers 35          Layers to offload to GPU (int; -1 = all).
  *   SYSTEM &lt;text&gt;                       Single-line system prompt.
  *   SYSTEM """                          Multi-line system prompt.
  *   ...content...
@@ -95,11 +96,12 @@ public final class Modelfile {
         String val = paramLine.substring(spaceIdx + 1).strip();
         try {
             switch (key) {
-                case "temperature":  config.setTemperature(Float.parseFloat(val));   break;
-                case "num_predict":  config.setNumPredict(Integer.parseInt(val));    break;
-                case "num_ctx":      config.setNumCtx(Integer.parseInt(val));        break;
+                case "temperature":    config.setTemperature(Float.parseFloat(val));   break;
+                case "num_predict":    config.setNumPredict(Integer.parseInt(val));    break;
+                case "num_ctx":        config.setNumCtx(Integer.parseInt(val));        break;
                 case "num_thread":
-                case "num_threads":  config.setNumThreads(Integer.parseInt(val));    break;
+                case "num_threads":    config.setNumThreads(Integer.parseInt(val));    break;
+                case "num_gpu_layers": config.setNumGpuLayers(Integer.parseInt(val));  break;
                 // top_p, top_k, repeat_penalty, etc. are accepted by Ollama but not
                 // yet plumbed through; ignore silently for forward-compat.
             }
@@ -129,6 +131,9 @@ public final class Modelfile {
         }
         if (config.getNumThreads() != null) {
             sb.append("PARAMETER num_threads ").append(config.getNumThreads()).append('\n');
+        }
+        if (config.getNumGpuLayers() != null) {
+            sb.append("PARAMETER num_gpu_layers ").append(config.getNumGpuLayers()).append('\n');
         }
         String sys = config.getSystemPrompt();
         if (sys != null && !sys.isEmpty()) {

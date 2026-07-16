@@ -52,8 +52,9 @@ import java.util.regex.Pattern;
  */
 public class ModelRunner {
 
-    private static final int   DEFAULT_N_CTX       = 4096;
-    private static final int   DEFAULT_N_THREADS   = Math.max(1, Runtime.getRuntime().availableProcessors());
+    private static final int   DEFAULT_N_CTX        = 4096;
+    private static final int   DEFAULT_N_THREADS    = Math.max(1, Runtime.getRuntime().availableProcessors());
+    private static final int   DEFAULT_N_GPU_LAYERS = 0;
     private static final float DEFAULT_TEMPERATURE  = 0.8f;
     private static final int   DEFAULT_NUM_PREDICT  = 512;
 
@@ -158,10 +159,11 @@ public class ModelRunner {
     // ── JNI interactive loop ──────────────────────────────────────────────────
 
     private void runInteractiveJni(ModelConfig model) throws Exception {
-        int   nCtx        = model.getNumCtx()      != null ? model.getNumCtx()      : DEFAULT_N_CTX;
-        int   nThreads    = model.getNumThreads()  != null ? model.getNumThreads()  : DEFAULT_N_THREADS;
-        float temperature = model.getTemperature() != null ? model.getTemperature() : DEFAULT_TEMPERATURE;
-        int   numPredict  = model.getNumPredict()  != null ? model.getNumPredict()  : DEFAULT_NUM_PREDICT;
+        int   nCtx        = model.getNumCtx()        != null ? model.getNumCtx()        : DEFAULT_N_CTX;
+        int   nThreads    = model.getNumThreads()    != null ? model.getNumThreads()    : DEFAULT_N_THREADS;
+        int   nGpuLayers  = model.getNumGpuLayers()  != null ? model.getNumGpuLayers()  : DEFAULT_N_GPU_LAYERS;
+        float temperature = model.getTemperature()   != null ? model.getTemperature()   : DEFAULT_TEMPERATURE;
+        int   numPredict  = model.getNumPredict()    != null ? model.getNumPredict()    : DEFAULT_NUM_PREDICT;
         String baseSystem = model.getSystemPrompt();
 
         // If tools are loaded, append tool-use instructions to the system prompt.
@@ -186,7 +188,7 @@ public class ModelRunner {
 
         List<String[]> history = new ArrayList<>(); // [role, content] pairs
 
-        try (LlamaModel llama = new LlamaModel(model.getPath(), 0);
+        try (LlamaModel llama = new LlamaModel(model.getPath(), nGpuLayers);
              BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in))) {
 
             // Create context once; reuse across turns.
@@ -281,10 +283,11 @@ public class ModelRunner {
     // ── Non-interactive (one-shot) ────────────────────────────────────────────
 
     private void runOnceJni(ModelConfig model, String prompt) throws Exception {
-        int   nCtx        = model.getNumCtx()      != null ? model.getNumCtx()      : DEFAULT_N_CTX;
-        int   nThreads    = model.getNumThreads()  != null ? model.getNumThreads()  : DEFAULT_N_THREADS;
-        float temperature = model.getTemperature() != null ? model.getTemperature() : DEFAULT_TEMPERATURE;
-        int   numPredict  = model.getNumPredict()  != null ? model.getNumPredict()  : DEFAULT_NUM_PREDICT;
+        int   nCtx        = model.getNumCtx()        != null ? model.getNumCtx()        : DEFAULT_N_CTX;
+        int   nThreads    = model.getNumThreads()    != null ? model.getNumThreads()    : DEFAULT_N_THREADS;
+        int   nGpuLayers  = model.getNumGpuLayers()  != null ? model.getNumGpuLayers()  : DEFAULT_N_GPU_LAYERS;
+        float temperature = model.getTemperature()   != null ? model.getTemperature()   : DEFAULT_TEMPERATURE;
+        int   numPredict  = model.getNumPredict()    != null ? model.getNumPredict()    : DEFAULT_NUM_PREDICT;
 
         // Build effective system prompt: RAG context first, then model system prompt.
         String effectiveSystem = model.getSystemPrompt();
@@ -304,7 +307,7 @@ public class ModelRunner {
         List<String[]> history = Collections.singletonList(new String[]{"user", prompt});
         String fullPrompt = plugins.applyInterceptors(buildPrompt(history, effectiveSystem));
 
-        try (LlamaModel llama = new LlamaModel(model.getPath(), 0)) {
+        try (LlamaModel llama = new LlamaModel(model.getPath(), nGpuLayers)) {
             LlamaContext ctx = llama.createContext(nCtx, nThreads);
             quietNativeLogs();
             try {

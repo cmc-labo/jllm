@@ -282,13 +282,14 @@ public class Main {
         }
 
         // Snapshot before changes (for diff output)
-        Float   prevTemp    = model.getTemperature();
-        Integer prevPredict = model.getNumPredict();
-        Integer prevCtx     = model.getNumCtx();
-        Integer prevThreads = model.getNumThreads();
-        String  prevSystem  = model.getSystemPrompt();
-        String  prevPath    = model.getPath();
-        String  prevBinary  = model.getBinary();
+        Float   prevTemp      = model.getTemperature();
+        Integer prevPredict   = model.getNumPredict();
+        Integer prevCtx       = model.getNumCtx();
+        Integer prevThreads   = model.getNumThreads();
+        Integer prevGpuLayers = model.getNumGpuLayers();
+        String  prevSystem    = model.getSystemPrompt();
+        String  prevPath      = model.getPath();
+        String  prevBinary    = model.getBinary();
         boolean ggufRefreshed = false;
 
         for (int i = 2; i < args.length; i++) {
@@ -304,6 +305,9 @@ public class Main {
                     break;
                 case "--threads": case "--num-threads":
                     if (i + 1 < args.length) model.setNumThreads(Integer.parseInt(args[++i]));
+                    break;
+                case "--gpu-layers": case "--num-gpu-layers":
+                    if (i + 1 < args.length) model.setNumGpuLayers(Integer.parseInt(args[++i]));
                     break;
                 case "--system":
                     if (i + 1 < args.length) model.setSystemPrompt(args[++i]);
@@ -338,14 +342,15 @@ public class Main {
                     if (i + 1 < args.length) {
                         String param = args[++i];
                         switch (param) {
-                            case "temperature":                        model.setTemperature(null);   break;
-                            case "max-tokens": case "num-predict":     model.setNumPredict(null);    break;
-                            case "ctx":        case "num-ctx":         model.setNumCtx(null);        break;
-                            case "threads":    case "num-threads":     model.setNumThreads(null);    break;
-                            case "system":                             model.setSystemPrompt(null);  break;
+                            case "temperature":                        model.setTemperature(null);    break;
+                            case "max-tokens": case "num-predict":     model.setNumPredict(null);     break;
+                            case "ctx":        case "num-ctx":         model.setNumCtx(null);         break;
+                            case "threads":    case "num-threads":     model.setNumThreads(null);     break;
+                            case "gpu-layers": case "num-gpu-layers":  model.setNumGpuLayers(null);   break;
+                            case "system":                             model.setSystemPrompt(null);   break;
                             default:
                                 System.err.println("Unknown parameter '" + param + "'.");
-                                System.err.println("Unset-able params: temperature  max-tokens  ctx  threads  system");
+                                System.err.println("Unset-able params: temperature  max-tokens  ctx  threads  gpu-layers  system");
                                 System.exit(1);
                         }
                     }
@@ -358,13 +363,14 @@ public class Main {
         }
 
         boolean changed = ggufRefreshed
-                || !objEq(prevTemp,    model.getTemperature())
-                || !objEq(prevPredict, model.getNumPredict())
-                || !objEq(prevCtx,     model.getNumCtx())
-                || !objEq(prevThreads, model.getNumThreads())
-                || !objEq(prevSystem,  model.getSystemPrompt())
-                || !objEq(prevPath,    model.getPath())
-                || !objEq(prevBinary,  model.getBinary());
+                || !objEq(prevTemp,      model.getTemperature())
+                || !objEq(prevPredict,   model.getNumPredict())
+                || !objEq(prevCtx,       model.getNumCtx())
+                || !objEq(prevThreads,   model.getNumThreads())
+                || !objEq(prevGpuLayers, model.getNumGpuLayers())
+                || !objEq(prevSystem,    model.getSystemPrompt())
+                || !objEq(prevPath,      model.getPath())
+                || !objEq(prevBinary,    model.getBinary());
 
         if (!changed) {
             System.out.println("No changes — configuration already matches the given values.");
@@ -373,13 +379,14 @@ public class Main {
 
         registry.add(model);
         System.out.println("Updated '" + name + "':");
-        printParamDiff("temperature", prevTemp,    model.getTemperature());
-        printParamDiff("num_predict", prevPredict, model.getNumPredict());
-        printParamDiff("num_ctx",     prevCtx,     model.getNumCtx());
-        printParamDiff("num_threads", prevThreads, model.getNumThreads());
-        printParamDiff("system",      prevSystem,  model.getSystemPrompt());
-        printParamDiff("path",        prevPath,    model.getPath());
-        printParamDiff("binary",      prevBinary,  model.getBinary());
+        printParamDiff("temperature",   prevTemp,      model.getTemperature());
+        printParamDiff("num_predict",   prevPredict,   model.getNumPredict());
+        printParamDiff("num_ctx",       prevCtx,       model.getNumCtx());
+        printParamDiff("num_threads",   prevThreads,   model.getNumThreads());
+        printParamDiff("num_gpu_layers",prevGpuLayers, model.getNumGpuLayers());
+        printParamDiff("system",        prevSystem,    model.getSystemPrompt());
+        printParamDiff("path",          prevPath,      model.getPath());
+        printParamDiff("binary",        prevBinary,    model.getBinary());
         if (ggufRefreshed) {
             printGgufSummary(model);
             printSha256Summary(model);
@@ -439,6 +446,7 @@ public class Main {
         Integer overrideMaxTokens   = null;
         Integer overrideCtx         = null;
         Integer overrideThreads     = null;
+        Integer overrideGpuLayers   = null;
 
         for (int i = 2; i < args.length; i++) {
             switch (args[i]) {
@@ -461,6 +469,9 @@ public class Main {
                 case "--threads":
                 case "--num-threads":
                     if (i + 1 < args.length) overrideThreads = Integer.parseInt(args[++i]); break;
+                case "--gpu-layers":
+                case "--num-gpu-layers":
+                    if (i + 1 < args.length) overrideGpuLayers = Integer.parseInt(args[++i]); break;
                 default:
                     System.err.println("Unknown flag: " + args[i]);
                     System.exit(1);
@@ -475,7 +486,8 @@ public class Main {
 
         // Apply session-level overrides to a shallow copy — registry entry is never modified.
         model = applyRunOverrides(model, overrideTemperature, overrideMaxTokens,
-                                  overrideCtx, overrideThreads, overrideSystem, clearSystem);
+                                  overrideCtx, overrideThreads, overrideGpuLayers,
+                                  overrideSystem, clearSystem);
 
         ModelRunner runner = new ModelRunner(plugins, ragManager, ragCollection);
 
@@ -511,7 +523,7 @@ public class Main {
      */
     private static ModelConfig applyRunOverrides(ModelConfig src,
             Float temperature, Integer maxTokens, Integer ctx, Integer threads,
-            String system, boolean clearSystem) {
+            Integer gpuLayers, String system, boolean clearSystem) {
         ModelConfig c = new ModelConfig();
         c.setName(src.getName());
         c.setPath(src.getPath());
@@ -524,6 +536,7 @@ public class Main {
         c.setNumPredict(maxTokens     != null ? maxTokens    : src.getNumPredict());
         c.setNumCtx(ctx               != null ? ctx          : src.getNumCtx());
         c.setNumThreads(threads       != null ? threads      : src.getNumThreads());
+        c.setNumGpuLayers(gpuLayers   != null ? gpuLayers   : src.getNumGpuLayers());
         c.setSystemPrompt(clearSystem ? "" : (system != null ? system : src.getSystemPrompt()));
         return c;
     }
@@ -1152,17 +1165,19 @@ public class Main {
     // ── helpers ───────────────────────────────────────────────────────────────
 
     private static void printModelfileParams(ModelConfig m) {
-        boolean any = m.getTemperature() != null || m.getNumPredict() != null
-                   || m.getNumCtx()     != null || m.getNumThreads() != null
+        boolean any = m.getTemperature()  != null || m.getNumPredict()   != null
+                   || m.getNumCtx()       != null || m.getNumThreads()   != null
+                   || m.getNumGpuLayers() != null
                    || (m.getSystemPrompt() != null && !m.getSystemPrompt().isEmpty());
         if (!any) return;
 
         System.out.println();
         System.out.println("Parameters:");
-        if (m.getTemperature()  != null) System.out.println("  temperature   " + m.getTemperature());
-        if (m.getNumPredict()   != null) System.out.println("  num_predict   " + m.getNumPredict());
-        if (m.getNumCtx()       != null) System.out.println("  num_ctx       " + m.getNumCtx());
-        if (m.getNumThreads()   != null) System.out.println("  num_threads   " + m.getNumThreads());
+        if (m.getTemperature()  != null) System.out.println("  temperature     " + m.getTemperature());
+        if (m.getNumPredict()   != null) System.out.println("  num_predict     " + m.getNumPredict());
+        if (m.getNumCtx()       != null) System.out.println("  num_ctx         " + m.getNumCtx());
+        if (m.getNumThreads()   != null) System.out.println("  num_threads     " + m.getNumThreads());
+        if (m.getNumGpuLayers() != null) System.out.println("  num_gpu_layers  " + m.getNumGpuLayers());
         if (m.getSystemPrompt() != null && !m.getSystemPrompt().isEmpty()) {
             String sys = m.getSystemPrompt();
             String preview = sys.length() > 80 ? sys.substring(0, 77) + "..." : sys;
@@ -1434,6 +1449,7 @@ public class Main {
         System.out.println("  --max-tokens <int>       Set max output tokens (num_predict)");
         System.out.println("  --ctx <int>              Set context window size (num_ctx)");
         System.out.println("  --threads <int>          Set CPU thread count (num_threads)");
+        System.out.println("  --gpu-layers <int>       Set GPU layers to offload (num_gpu_layers; -1 = all, 0 = CPU only)");
         System.out.println("  --system <text>          Set system prompt");
         System.out.println("  --no-system              Clear system prompt");
         System.out.println("  --path <path>            Update GGUF file path (also recalculates size and refreshes metadata)");
@@ -1441,11 +1457,12 @@ public class Main {
         System.out.println("  --refresh-gguf           Re-read GGUF metadata from the current file");
         System.out.println("  --refresh-hash           Recompute and store SHA-256 checksum");
         System.out.println("  --unset <param>          Reset a parameter to the runtime default (null)");
-        System.out.println("                           Params: temperature | max-tokens | ctx | threads | system");
+        System.out.println("                           Params: temperature | max-tokens | ctx | threads | gpu-layers | system");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  jllm update phi3:mini --temperature 0.2");
         System.out.println("  jllm update phi3:mini --ctx 8192 --threads 8");
+        System.out.println("  jllm update phi3:mini --gpu-layers 35");
         System.out.println("  jllm update phi3:mini --system \"You are a coding assistant.\"");
         System.out.println("  jllm update phi3:mini --no-system");
         System.out.println("  jllm update phi3:mini --unset temperature");
@@ -1521,6 +1538,7 @@ public class Main {
         System.out.println("             [--max-tokens <int>]         Set max output tokens");
         System.out.println("             [--ctx <int>]                Set context window size");
         System.out.println("             [--threads <int>]            Set CPU thread count");
+        System.out.println("             [--gpu-layers <int>]         Set GPU layers (-1 = all, 0 = CPU only)");
         System.out.println("             [--system <text>]            Set system prompt");
         System.out.println("             [--no-system]                Clear system prompt");
         System.out.println("             [--path <path>]              Update GGUF file path");
@@ -1535,6 +1553,7 @@ public class Main {
         System.out.println("             [--max-tokens <int>]         Override max output tokens");
         System.out.println("             [--ctx <int>]                Override context window size");
         System.out.println("             [--threads <int>]            Override CPU thread count");
+        System.out.println("             [--gpu-layers <int>]         Override GPU layers (-1 = all, 0 = CPU only)");
         System.out.println("             (stdin pipe auto-detected: echo \"...\" | jllm run <name>)");
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
         System.out.println("        [--max-concurrent <n>]            Max parallel inference slots (default: CPU count)");

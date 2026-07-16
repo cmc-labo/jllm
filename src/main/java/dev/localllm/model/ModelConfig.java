@@ -26,6 +26,7 @@ public class ModelConfig {
     private Integer numPredict;
     private Integer numCtx;
     private Integer numThreads;
+    private Integer numGpuLayers;  // null = CPU only (0); negative = all layers
     private String  systemPrompt;
 
     // SHA-256 hex digest of the GGUF file (null = not yet computed)
@@ -72,6 +73,9 @@ public class ModelConfig {
 
     public Integer getNumThreads() { return numThreads; }
     public void setNumThreads(Integer numThreads) { this.numThreads = numThreads; }
+
+    public Integer getNumGpuLayers() { return numGpuLayers; }
+    public void setNumGpuLayers(Integer numGpuLayers) { this.numGpuLayers = numGpuLayers; }
 
     public String getSystemPrompt() { return systemPrompt; }
     public void setSystemPrompt(String systemPrompt) { this.systemPrompt = systemPrompt; }

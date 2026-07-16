@@ -631,7 +631,8 @@ public class ApiServer {
 
     private LlamaModel loadModel(HttpServerExchange ex, ModelConfig cfg) throws Exception {
         try {
-            return loadedModels.computeIfAbsent(cfg.getName(), n -> new LlamaModel(cfg.getPath(), 0));
+            int nGpuLayers = cfg.getNumGpuLayers() != null ? cfg.getNumGpuLayers() : 0;
+            return loadedModels.computeIfAbsent(cfg.getName(), n -> new LlamaModel(cfg.getPath(), nGpuLayers));
         } catch (Exception e) {
             LOG.error("failed to load model '{}'", cfg.getName(), e);
             sendError(ex, 500, "failed to load model: " + e.getMessage());
