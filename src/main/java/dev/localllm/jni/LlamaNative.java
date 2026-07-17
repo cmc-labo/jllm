@@ -135,4 +135,21 @@ public final class LlamaNative {
      * @return 0 on success, non-zero on failure
      */
     public static native int quantize(String inputPath, String outputPath, int ftypeInt, int nThreads);
+
+    // ── Embeddings ────────────────────────────────────────────────────────────
+
+    /**
+     * Encode {@code tokens} and return an L2-normalized embedding vector.
+     *
+     * <p>Creates a temporary embedding context each call (not suitable for
+     * high-frequency use; the resulting vector is independent of any inference
+     * context).
+     *
+     * @param model     native model handle
+     * @param nCtx      context size (≥ number of tokens); 0 defaults to 512
+     * @param nThreads  CPU threads; ≤0 = single thread
+     * @param tokens    tokenized input; must not be empty
+     * @return L2-normalized float vector of length {@code n_embd}
+     */
+    public static native float[] embed(long model, int nCtx, int nThreads, int[] tokens);
 }

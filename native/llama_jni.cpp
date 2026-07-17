@@ -43,6 +43,7 @@
 #include "ggml-backend.h"
 
 #include <atomic>
+#include <cmath>
 #include <csetjmp>
 #include <csignal>
 #include <cstdio>
@@ -955,6 +956,107 @@ JNIEXPORT void JNICALL Java_dev_localllm_jni_LlamaNative_kvSeqRm
         throwIllegalState(env, std::string("kvSeqRm failed: ") + e.what());
     } catch (...) {
         throwIllegalState(env, "kvSeqRm failed: unknown native exception");
+    }
+}
+
+// ── Embeddings ───────────────────────────────────────────────────────────────
+
+JNIEXPORT jfloatArray JNICALL Java_dev_localllm_jni_LlamaNative_embed
+  (JNIEnv* env, jclass, jlong modelHandle, jint nCtx, jint nThreads, jintArray jtokens) {
+    LLAMA_JNI_GUARD_BEGIN(env, nullptr);
+    if (modelHandle == 0) {
+        throwIllegalArgument(env, "model handle must not be 0");
+        return nullptr;
+    }
+    if (jtokens == nullptr) {
+        throwIllegalArgument(env, "tokens must not be null");
+        return nullptr;
+    }
+    llama_model* model = asModel(modelHandle);
+    JIntArrayElems tokens(env, jtokens);
+    if (tokens.get() == nullptr) {
+        throwIllegalArgument(env, "failed to pin token array");
+        return nullptr;
+    }
+    jsize n = env->GetArrayLength(jtokens);
+    if (n == 0) {
+        throwIllegalArgument(env, "token array must not be empty");
+        return nullptr;
+    }
+    try {
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx         = (nCtx > 0)     ? static_cast<uint32_t>(nCtx)     : 512u;
+        cparams.n_batch       = static_cast<uint32_t>(n);
+        cparams.n_threads     = (nThreads > 0) ? static_cast<uint32_t>(nThreads) : 1u;
+        cparams.embeddings    = true;
+        cparams.pooling_type  = LLAMA_POOLING_TYPE_UNSPECIFIED;
+
+        llama_context* ctx = llama_init_from_model(model, cparams);
+        if (ctx == nullptr) {
+            throwIllegalState(env, "failed to create embedding context");
+            return nullptr;
+        }
+
+        llama_batch batch = llama_batch_get_one(
+            reinterpret_cast<llama_token*>(tokens.get()),
+            static_cast<int32_t>(n));
+
+        int ret;
+        if (llama_model_has_encoder(model) && !llama_model_has_decoder(model)) {
+            ret = llama_encode(ctx, batch);
+        } else {
+            ret = llama_decode(ctx, batch);
+        }
+
+        if (ret != 0) {
+            llama_free(ctx);
+            throwIllegalState(env, std::string("inference failed: ") + std::to_string(ret));
+            return nullptr;
+        }
+
+        int32_t nEmbd = llama_model_n_embd(model);
+        float* embd   = nullptr;
+
+        enum llama_pooling_type pt = llama_pooling_type(ctx);
+        if (pt == LLAMA_POOLING_TYPE_NONE) {
+            embd = llama_get_embeddings_ith(ctx, static_cast<int32_t>(n) - 1);
+        } else {
+            embd = llama_get_embeddings_seq(ctx, 0);
+        }
+
+        if (embd == nullptr) {
+            llama_free(ctx);
+            throwIllegalState(env, "embeddings pointer is null");
+            return nullptr;
+        }
+
+        // L2 normalize
+        float norm = 0.0f;
+        for (int32_t i = 0; i < nEmbd; i++) norm += embd[i] * embd[i];
+        norm = std::sqrt(norm);
+
+        std::vector<float> normalized(nEmbd);
+        if (norm > 0.0f) {
+            for (int32_t i = 0; i < nEmbd; i++) normalized[i] = embd[i] / norm;
+        } else {
+            for (int32_t i = 0; i < nEmbd; i++) normalized[i] = embd[i];
+        }
+
+        llama_free(ctx);
+
+        jfloatArray result = env->NewFloatArray(nEmbd);
+        if (result == nullptr) {
+            throwOutOfMemory(env, "failed to allocate embedding float array");
+            return nullptr;
+        }
+        env->SetFloatArrayRegion(result, 0, nEmbd, normalized.data());
+        return result;
+    } catch (const std::exception& e) {
+        throwIllegalState(env, std::string("embed failed: ") + e.what());
+        return nullptr;
+    } catch (...) {
+        throwIllegalState(env, "embed failed: unknown native exception");
+        return nullptr;
     }
 }
 

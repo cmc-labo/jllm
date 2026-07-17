@@ -1018,10 +1018,12 @@ handlers — both Ollama and OpenAI endpoints.
 | `POST` | `/api/show`             | Ollama  | Model details (Modelfile + parameters) |
 | `POST` | `/api/generate`         | Ollama  | Text generation |
 | `POST` | `/api/chat`             | Ollama  | Chat completion |
+| `POST` | `/api/embeddings`       | Ollama  | Text embeddings |
 | `GET`  | `/api/ps`               | Ollama  | Context pool stats and idle context count |
 | `GET`  | `/v1/models`            | OpenAI  | List models |
 | `POST` | `/v1/chat/completions`  | OpenAI  | Chat completion |
 | `POST` | `/v1/completions`       | OpenAI  | Text completion |
+| `POST` | `/v1/embeddings`        | OpenAI  | Text embeddings |
 
 ### OpenAI: `GET /v1/models`
 
@@ -1082,6 +1084,44 @@ Non-streaming (`"stream": false`):
 curl http://localhost:11434/v1/completions \
   -d '{ "model": "phi3:mini", "prompt": "Once upon a time", "max_tokens": 128 }'
 ```
+
+### Embeddings: `POST /api/embeddings` and `POST /v1/embeddings`
+
+Requires the JNI native library. The model runs a dedicated embedding context (no KV cache is shared with inference requests) and returns an L2-normalized float vector.
+
+**Ollama format** (`/api/embeddings`):
+
+```bash
+curl http://localhost:11434/api/embeddings \
+  -d '{ "model": "nomic-embed-text", "prompt": "Hello, world!" }'
+```
+
+```json
+{
+  "model": "nomic-embed-text",
+  "embedding": [0.023, -0.011, 0.047, "..."]
+}
+```
+
+**OpenAI format** (`/v1/embeddings`):
+
+```bash
+curl http://localhost:11434/v1/embeddings \
+  -d '{ "model": "nomic-embed-text", "input": "Hello, world!" }'
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "embedding": [0.023, -0.011, 0.047, "..."], "index": 0 }
+  ],
+  "model": "nomic-embed-text",
+  "usage": { "prompt_tokens": 0, "total_tokens": 0 }
+}
+```
+
+Both endpoints also accept `"input"` as an array — only the first element is embedded (single-vector response). The vector dimension matches the model's `n_embd`. BERT-style encoder models (`nomic-embed-text`, `mxbai-embed-large`, etc.) and decoder-based embedding models (LLaMA with `--embeddings`) are both supported.
 
 ### Ollama: `POST /api/show` — Model details
 

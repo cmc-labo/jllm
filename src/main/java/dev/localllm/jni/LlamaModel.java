@@ -110,6 +110,21 @@ public final class LlamaModel implements AutoCloseable {
         return LlamaNative.isEog(handle, token);
     }
 
+    /**
+     * Tokenize {@code text} and return an L2-normalized embedding vector.
+     * Uses a temporary embedding context internally; safe to call concurrently.
+     *
+     * @param text      input to embed
+     * @param nCtx      context window size (must be ≥ token count); 0 → 512
+     * @param nThreads  CPU threads; ≤0 = single thread
+     * @return L2-normalized float[] of length n_embd
+     */
+    public float[] embed(String text, int nCtx, int nThreads) {
+        checkOpen();
+        int[] tokens = LlamaNative.tokenize(handle, text, true, true);
+        return LlamaNative.embed(handle, nCtx, nThreads, tokens);
+    }
+
     long handle() {
         checkOpen();
         return handle;

@@ -191,10 +191,12 @@ public class ApiServer {
             .post("/api/show",            b(this::handleShow))
             .post("/api/generate",        b(this::handleGenerate))
             .post("/api/chat",            b(this::handleChat))
+            .post("/api/embeddings",      b(this::handleEmbeddings))
             // ── OpenAI API ───────────────────────────────────────────────────
             .get("/v1/models",            b(this::handleV1Models))
             .post("/v1/chat/completions", b(this::handleV1ChatCompletions))
-            .post("/v1/completions",      b(this::handleV1Completions));
+            .post("/v1/completions",      b(this::handleV1Completions))
+            .post("/v1/embeddings",       b(this::handleV1Embeddings));
 
         Undertow server = Undertow.builder()
             .addHttpListener(port, "0.0.0.0")
@@ -217,11 +219,13 @@ public class ApiServer {
         System.out.printf("  POST /api/show              http://localhost:%d/api/show%n", port);
         System.out.printf("  POST /api/generate          http://localhost:%d/api/generate%n", port);
         System.out.printf("  POST /api/chat              http://localhost:%d/api/chat%n", port);
+        System.out.printf("  POST /api/embeddings        http://localhost:%d/api/embeddings%n", port);
         System.out.println();
         System.out.println("OpenAI-compatible:");
         System.out.printf("  GET  /v1/models             http://localhost:%d/v1/models%n", port);
         System.out.printf("  POST /v1/chat/completions   http://localhost:%d/v1/chat/completions%n", port);
         System.out.printf("  POST /v1/completions        http://localhost:%d/v1/completions%n", port);
+        System.out.printf("  POST /v1/embeddings         http://localhost:%d/v1/embeddings%n", port);
         System.out.println();
         System.out.println("Press Ctrl+C to stop.");
 
@@ -442,6 +446,100 @@ public class ApiServer {
         } catch (Exception e) {
             LOG.error("chat failed for '{}'", modelName, e);
             if (!ex.isResponseStarted()) sendError(ex, 500, "chat failed: " + e.getMessage());
+        }
+    }
+
+    // ── Ollama: POST /api/embeddings ──────────────────────────────────────────
+
+    private void handleEmbeddings(HttpServerExchange ex) throws Exception {
+        JsonObject req   = parseJson(ex);
+        String modelName = req.has("model") ? req.get("model").getAsString() : null;
+        // Ollama accepts both "prompt" (single string) and "input" (string or array)
+        String text = null;
+        if (req.has("prompt") && !req.get("prompt").isJsonNull()) {
+            text = req.get("prompt").getAsString();
+        } else if (req.has("input") && !req.get("input").isJsonNull()) {
+            if (req.get("input").isJsonArray()) {
+                // For array input, embed first element only (Ollama v1 behaviour)
+                text = req.getAsJsonArray("input").get(0).getAsString();
+            } else {
+                text = req.get("input").getAsString();
+            }
+        }
+        if (modelName == null || modelName.isEmpty()) { sendError(ex, 400, "model is required"); return; }
+        if (text == null || text.isEmpty())            { sendError(ex, 400, "prompt or input is required"); return; }
+
+        ModelConfig cfg = requireModel(ex, modelName); if (cfg == null) return;
+        LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
+
+        if (!LlamaModel.isNativeLibraryAvailable()) {
+            sendError(ex, 501, "embeddings require the native JNI library");
+            return;
+        }
+
+        try {
+            int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
+            int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
+            float[] embd = model.embed(text, nCtx, nThreads);
+
+            List<Double> embdList = new ArrayList<>(embd.length);
+            for (float v : embd) embdList.add((double) v);
+
+            sendJson(ex, 200, map("model", modelName, "embedding", embdList));
+        } catch (Exception e) {
+            LOG.error("embeddings failed for '{}'", modelName, e);
+            if (!ex.isResponseStarted()) sendError(ex, 500, "embeddings failed: " + e.getMessage());
+        }
+    }
+
+    // ── OpenAI: POST /v1/embeddings ───────────────────────────────────────────
+
+    private void handleV1Embeddings(HttpServerExchange ex) throws Exception {
+        JsonObject req   = parseJson(ex);
+        String modelName = req.has("model") ? req.get("model").getAsString() : null;
+        // "input" can be a string or array of strings; embed first (or only) element
+        String text = null;
+        if (req.has("input") && !req.get("input").isJsonNull()) {
+            if (req.get("input").isJsonArray()) {
+                JsonArray arr = req.getAsJsonArray("input");
+                if (arr.size() > 0) text = arr.get(0).getAsString();
+            } else {
+                text = req.get("input").getAsString();
+            }
+        }
+        if (modelName == null || modelName.isEmpty()) { sendError(ex, 400, "model is required"); return; }
+        if (text == null || text.isEmpty())            { sendError(ex, 400, "input is required"); return; }
+
+        ModelConfig cfg = requireModel(ex, modelName); if (cfg == null) return;
+        LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
+
+        if (!LlamaModel.isNativeLibraryAvailable()) {
+            sendError(ex, 501, "embeddings require the native JNI library");
+            return;
+        }
+
+        try {
+            int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
+            int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
+            float[] embd = model.embed(text, nCtx, nThreads);
+
+            List<Double> embdList = new ArrayList<>(embd.length);
+            for (float v : embd) embdList.add((double) v);
+
+            Map<String, Object> dataEntry = new LinkedHashMap<>();
+            dataEntry.put("object",    "embedding");
+            dataEntry.put("embedding", embdList);
+            dataEntry.put("index",     0);
+
+            sendJson(ex, 200, map(
+                "object", "list",
+                "data",   Collections.singletonList(dataEntry),
+                "model",  modelName,
+                "usage",  map("prompt_tokens", 0, "total_tokens", 0)
+            ));
+        } catch (Exception e) {
+            LOG.error("v1/embeddings failed for '{}'", modelName, e);
+            if (!ex.isResponseStarted()) sendError(ex, 500, "embeddings failed: " + e.getMessage());
         }
     }
 
