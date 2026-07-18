@@ -3,6 +3,7 @@ package dev.localllm.server;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.localllm.jni.LlamaContext;
 import dev.localllm.jni.LlamaModel;
@@ -37,6 +38,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Embedded HTTP server with both Ollama-compatible and OpenAI-compatible REST APIs.
@@ -79,6 +82,10 @@ public class ApiServer {
     private static final int   DEFAULT_NUM_PREDICT   = 200;
     private static final int   DEFAULT_CHAT_PREDICT  = 500;
     private static final int   DEFAULT_MAX_CONCURRENT = Runtime.getRuntime().availableProcessors();
+
+    // Matches the <tool_call>{...}</tool_call> tag the model emits for function calling.
+    private static final Pattern TOOL_CALL_RE =
+        Pattern.compile("<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>", Pattern.DOTALL);
 
     // Pre-allocated HttpString instances for headers used on every response.
     private static final HttpString HDR_CORS_ORIGIN  = new HttpString("Access-Control-Allow-Origin");
@@ -566,34 +573,89 @@ public class ApiServer {
         JsonArray messages = req.getAsJsonArray("messages");
         GenOpts opts      = GenOpts.fromOpenAi(req);
 
+        // ── tool calling ──────────────────────────────────────────────────────
+        JsonArray tools = req.has("tools") && !req.get("tools").isJsonNull()
+            ? req.getAsJsonArray("tools") : null;
+        // tool_choice can be a string ("auto","none","required") or object; treat object as "auto"
+        String toolChoice = "auto";
+        if (req.has("tool_choice") && !req.get("tool_choice").isJsonNull()) {
+            toolChoice = req.get("tool_choice").isJsonPrimitive()
+                ? req.get("tool_choice").getAsString() : "auto";
+        }
+        boolean useTools = tools != null && tools.size() > 0 && !"none".equals(toolChoice);
+
         ModelConfig cfg = requireModel(ex, modelName); if (cfg == null) return;
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
         String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
         String effectiveSystem = ragEnhancedSystem(ragCollection, lastUserMessage(messages), cfg.getSystemPrompt());
-        String prompt = plugins.applyInterceptors(chatMlPrompt(messages, effectiveSystem));
+
+        // When tools are present inject instructions so the model knows to use <tool_call> tags.
+        if (useTools) effectiveSystem = buildToolSystemPrompt(tools, effectiveSystem);
+
+        String prompt = plugins.applyInterceptors(
+            useTools ? chatMlPromptWithTools(messages, effectiveSystem)
+                     : chatMlPrompt(messages, effectiveSystem));
         int nCtx     = cfg.getNumCtx()     != null ? cfg.getNumCtx()     : DEFAULT_N_CTX;
         int nThreads = cfg.getNumThreads() != null ? cfg.getNumThreads() : DEFAULT_N_THREADS;
         String id    = "chatcmpl-" + shortUuid();
         long created = Instant.now().getEpochSecond();
 
         try {
-            if (opts.stream) {
-                beginSse(ex);
-                try (OutputStream os = ex.getOutputStream()) {
-                    writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
-                    streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
-                        piece -> writeSse(os, openAiChatChunk(id, modelName, created, piece, null, null)));
-                    writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
-                    os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
-                    os.flush();
-                }
-            } else {
+            if (useTools) {
+                // Buffer the full response to detect <tool_call> tags before replying.
                 StringBuilder sb = new StringBuilder();
                 streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
                     sb::append);
-                sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
+                String response = sb.toString().trim();
+                ToolCallResult tcr = extractToolCall(response);
+
+                if (tcr != null) {
+                    if (opts.stream) {
+                        beginSse(ex);
+                        try (OutputStream os = ex.getOutputStream()) {
+                            writeSse(os, openAiToolCallChunk(id, modelName, created, tcr));
+                            writeSse(os, openAiSseFinishChunk(id, modelName, created, "tool_calls"));
+                            os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                            os.flush();
+                        }
+                    } else {
+                        sendJson(ex, 200, openAiToolCallResponse(id, modelName, created, tcr));
+                    }
+                } else {
+                    // Model didn't call a tool — return as a normal completion.
+                    if (opts.stream) {
+                        beginSse(ex);
+                        try (OutputStream os = ex.getOutputStream()) {
+                            writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
+                            writeSse(os, openAiChatChunk(id, modelName, created, response, null, null));
+                            writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
+                            os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                            os.flush();
+                        }
+                    } else {
+                        sendJson(ex, 200, openAiChatResponse(id, modelName, created, response));
+                    }
+                }
+            } else {
+                // Normal flow — no tools.
+                if (opts.stream) {
+                    beginSse(ex);
+                    try (OutputStream os = ex.getOutputStream()) {
+                        writeSse(os, openAiChatChunk(id, modelName, created, "", "assistant", null));
+                        streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                            piece -> writeSse(os, openAiChatChunk(id, modelName, created, piece, null, null)));
+                        writeSse(os, openAiChatChunk(id, modelName, created, "", null, "stop"));
+                        os.write("data: [DONE]\n\n".getBytes(StandardCharsets.UTF_8));
+                        os.flush();
+                    }
+                } else {
+                    StringBuilder sb = new StringBuilder();
+                    streamTokens(model, modelName, prompt, opts.numPredict, opts.temperature, nCtx, nThreads,
+                        sb::append);
+                    sendJson(ex, 200, openAiChatResponse(id, modelName, created, sb.toString()));
+                }
             }
         } catch (Exception e) {
             LOG.error("v1/chat/completions failed for '{}'", modelName, e);
@@ -910,6 +972,196 @@ public class ApiServer {
         r.put("model",   model);
         r.put("choices", Collections.singletonList(choice));
         r.put("usage",   map("prompt_tokens", 0, "completion_tokens", 0, "total_tokens", 0));
+        return r;
+    }
+
+    // ── Tool calling helpers ──────────────────────────────────────────────────
+
+    /**
+     * Parsed result of a {@code <tool_call>} tag found in model output.
+     * Carries a unique call-id for the client to correlate tool results.
+     */
+    private static final class ToolCallResult {
+        final String id;
+        final String name;
+        final String arguments; // compact JSON string
+
+        ToolCallResult(String name, String arguments) {
+            this.id        = "call_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+            this.name      = name;
+            this.arguments = arguments;
+        }
+    }
+
+    /**
+     * Build a system-prompt extension that tells the model to use {@code <tool_call>} tags
+     * and lists the available functions with their JSON schemas.
+     */
+    private static String buildToolSystemPrompt(JsonArray tools, String baseSystem) {
+        StringBuilder sb = new StringBuilder();
+        if (baseSystem != null && !baseSystem.isEmpty()) sb.append(baseSystem).append("\n\n");
+        sb.append("You have access to the following functions. ");
+        sb.append("To call a function, respond with ONLY:\n");
+        sb.append("<tool_call>{\"name\":\"FUNCTION_NAME\",\"arguments\":{...}}</tool_call>\n");
+        sb.append("Do not include any other text when calling a function.\n\n");
+        sb.append("Available functions (JSON Schema):\n");
+        for (int i = 0; i < tools.size(); i++) {
+            JsonObject t = tools.get(i).getAsJsonObject();
+            // Each tool entry is {"type":"function","function":{...}} per OpenAI spec.
+            sb.append(t.has("function") ? t.get("function").toString() : t.toString()).append("\n");
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    /**
+     * Like {@link #chatMlPrompt} but also handles {@code role:"tool"} result messages
+     * and {@code role:"assistant"} messages that carry {@code tool_calls} (conversation
+     * history replay from a previous turn).
+     */
+    private static String chatMlPromptWithTools(JsonArray messages, String systemPrompt) {
+        boolean hasSystem = false;
+        for (int i = 0; i < messages.size(); i++) {
+            if ("system".equals(messages.get(i).getAsJsonObject().get("role").getAsString())) {
+                hasSystem = true; break;
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        if (!hasSystem && systemPrompt != null && !systemPrompt.isEmpty()) {
+            sb.append("<|im_start|>system\n").append(systemPrompt).append("<|im_end|>\n");
+        }
+        for (int i = 0; i < messages.size(); i++) {
+            JsonObject msg  = messages.get(i).getAsJsonObject();
+            String role     = msg.get("role").getAsString();
+            String content  = msg.has("content") && !msg.get("content").isJsonNull()
+                              ? msg.get("content").getAsString() : "";
+
+            if ("tool".equals(role)) {
+                // Tool result injected as a user turn so the model can see the outcome.
+                String name = msg.has("name") ? msg.get("name").getAsString() : "tool";
+                sb.append("<|im_start|>user\n[Tool result for ").append(name).append("]: ")
+                  .append(content).append("<|im_end|>\n");
+
+            } else if ("assistant".equals(role) && msg.has("tool_calls")
+                       && !msg.get("tool_calls").isJsonNull()) {
+                // Replay an earlier assistant turn that called a function.
+                sb.append("<|im_start|>assistant\n");
+                JsonArray tcs = msg.getAsJsonArray("tool_calls");
+                for (int j = 0; j < tcs.size(); j++) {
+                    JsonObject tc = tcs.get(j).getAsJsonObject();
+                    JsonObject fn = tc.getAsJsonObject("function");
+                    String fnName = fn.get("name").getAsString();
+                    String fnArgs = fn.has("arguments") ? fn.get("arguments").getAsString() : "{}";
+                    sb.append("<tool_call>{\"name\":\"").append(fnName)
+                      .append("\",\"arguments\":").append(fnArgs).append("}</tool_call>");
+                }
+                sb.append("<|im_end|>\n");
+
+            } else {
+                sb.append("<|im_start|>").append(role).append("\n")
+                  .append(content).append("<|im_end|>\n");
+            }
+        }
+        return sb.append("<|im_start|>assistant\n").toString();
+    }
+
+    /**
+     * Detect and parse a {@code <tool_call>} tag in {@code text}.
+     * Accepts both {@code "arguments"} and {@code "args"} as the parameter key.
+     * Returns {@code null} if no valid tool call is found.
+     */
+    private static ToolCallResult extractToolCall(String text) {
+        Matcher m = TOOL_CALL_RE.matcher(text);
+        if (!m.find()) return null;
+        try {
+            JsonObject obj  = new Gson().fromJson(m.group(1).trim(), JsonObject.class);
+            String name     = obj.get("name").getAsString();
+            JsonElement args = obj.has("arguments") ? obj.get("arguments")
+                             : obj.has("args")      ? obj.get("args") : null;
+            String argsJson = (args != null && args.isJsonObject()) ? args.toString() : "{}";
+            return new ToolCallResult(name, argsJson);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Non-streaming response body when the model calls a function. */
+    private static Map<String, Object> openAiToolCallResponse(
+            String id, String model, long created, ToolCallResult tcr) {
+        Map<String, Object> fn = new LinkedHashMap<>();
+        fn.put("name", tcr.name);
+        fn.put("arguments", tcr.arguments);
+
+        Map<String, Object> tc = new LinkedHashMap<>();
+        tc.put("id",       tcr.id);
+        tc.put("type",     "function");
+        tc.put("function", fn);
+
+        Map<String, Object> msg = new LinkedHashMap<>();
+        msg.put("role",       "assistant");
+        msg.put("content",    null);
+        msg.put("tool_calls", Collections.singletonList(tc));
+
+        Map<String, Object> choice = new LinkedHashMap<>();
+        choice.put("index",         0);
+        choice.put("message",       msg);
+        choice.put("finish_reason", "tool_calls");
+
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("id",      id);
+        r.put("object",  "chat.completion");
+        r.put("created", created);
+        r.put("model",   model);
+        r.put("choices", Collections.singletonList(choice));
+        r.put("usage",   map("prompt_tokens", 0, "completion_tokens", 0, "total_tokens", 0));
+        return r;
+    }
+
+    /** First SSE chunk carrying the function-call delta (name + all arguments in one shot). */
+    private static Map<String, Object> openAiToolCallChunk(
+            String id, String model, long created, ToolCallResult tcr) {
+        Map<String, Object> fn = new LinkedHashMap<>();
+        fn.put("name",      tcr.name);
+        fn.put("arguments", tcr.arguments);
+
+        Map<String, Object> tc = new LinkedHashMap<>();
+        tc.put("index",    0);
+        tc.put("id",       tcr.id);
+        tc.put("type",     "function");
+        tc.put("function", fn);
+
+        Map<String, Object> delta = new LinkedHashMap<>();
+        delta.put("role",       "assistant");
+        delta.put("content",    null);
+        delta.put("tool_calls", Collections.singletonList(tc));
+
+        Map<String, Object> choice = new LinkedHashMap<>();
+        choice.put("index",         0);
+        choice.put("delta",         delta);
+        choice.put("finish_reason", null);
+
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("id",      id);
+        r.put("object",  "chat.completion.chunk");
+        r.put("created", created);
+        r.put("model",   model);
+        r.put("choices", Collections.singletonList(choice));
+        return r;
+    }
+
+    /** Terminal SSE chunk with an empty delta and the given finish_reason. */
+    private static Map<String, Object> openAiSseFinishChunk(
+            String id, String model, long created, String finishReason) {
+        Map<String, Object> choice = new LinkedHashMap<>();
+        choice.put("index",         0);
+        choice.put("delta",         Collections.emptyMap());
+        choice.put("finish_reason", finishReason);
+
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("id",      id);
+        r.put("object",  "chat.completion.chunk");
+        r.put("created", created);
+        r.put("model",   model);
+        r.put("choices", Collections.singletonList(choice));
         return r;
     }
 

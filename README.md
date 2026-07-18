@@ -1123,6 +1123,80 @@ curl http://localhost:11434/v1/embeddings \
 
 Both endpoints also accept `"input"` as an array — only the first element is embedded (single-vector response). The vector dimension matches the model's `n_embd`. BERT-style encoder models (`nomic-embed-text`, `mxbai-embed-large`, etc.) and decoder-based embedding models (LLaMA with `--embeddings`) are both supported.
 
+### OpenAI: `POST /v1/chat/completions` — Function calling (tools)
+
+Pass a `tools` array in the request body to enable function calling. The server injects a system prompt that instructs the model to respond with `<tool_call>` tags, detects that pattern in the model output, and translates it into the standard OpenAI `tool_calls` response format. Existing OpenAI SDK clients work without modification.
+
+```bash
+curl http://localhost:11434/v1/chat/completions \
+  -d '{
+    "model": "phi3:mini",
+    "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string", "description": "City name"}
+          },
+          "required": ["city"]
+        }
+      }
+    }],
+    "tool_choice": "auto",
+    "stream": false
+  }'
+```
+
+Response when the model decides to call a function:
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_a1b2c3d4",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Tokyo\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+After executing the function client-side, send the result back as a `tool` role message to continue:
+
+```bash
+curl http://localhost:11434/v1/chat/completions \
+  -d '{
+    "model": "phi3:mini",
+    "messages": [
+      {"role": "user", "content": "What is the weather in Tokyo?"},
+      {"role": "assistant", "content": null, "tool_calls": [{"id": "call_a1b2c3d4", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}}]},
+      {"role": "tool", "tool_call_id": "call_a1b2c3d4", "name": "get_weather", "content": "{\"temperature\": 28, \"condition\": \"sunny\"}"}
+    ],
+    "tools": [...],
+    "stream": false
+  }'
+```
+
+**Notes:**
+- `tool_choice: "none"` disables tool injection entirely; `"auto"` (default) lets the model decide
+- When `tools` is present the response is always buffered (no token-by-token streaming) so that `<tool_call>` tags can be detected; streaming mode is still supported and emits the result as SSE once generation completes
+- If the model does not emit a tool call the response is returned as a normal chat completion
+
 ### Ollama: `POST /api/show` — Model details
 
 ```bash
