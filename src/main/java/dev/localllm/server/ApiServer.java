@@ -8,9 +8,12 @@ import com.google.gson.JsonObject;
 import dev.localllm.jni.LlamaContext;
 import dev.localllm.jni.LlamaModel;
 import dev.localllm.server.BatchScheduler;
+import dev.localllm.model.GgufReader;
 import dev.localllm.model.ModelConfig;
 import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
+import dev.localllm.model.SplitGguf;
+import dev.localllm.pull.HuggingFaceClient;
 import dev.localllm.plugin.PluginManager;
 import dev.localllm.rag.RagManager;
 import dev.localllm.rag.RagResult;
@@ -26,8 +29,13 @@ import org.slf4j.LoggerFactory;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
+import java.util.Locale;
+import java.util.stream.Collectors;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -199,6 +207,13 @@ public class ApiServer {
             .post("/api/generate",        b(this::handleGenerate))
             .post("/api/chat",            b(this::handleChat))
             .post("/api/embeddings",      b(this::handleEmbeddings))
+            // ── Model management API ──────────────────────────────────────────
+            .post("/api/pull",            b(this::handleApiPull))
+            .post("/api/create",          b(this::handleApiCreate))
+            .post("/api/copy",            b(this::handleApiCopy))
+            .post("/api/delete",          b(this::handleApiDelete))
+            .delete("/api/delete",        b(this::handleApiDelete))
+            .post("/api/add",             b(this::handleApiAdd))
             // ── OpenAI API ───────────────────────────────────────────────────
             .get("/v1/models",            b(this::handleV1Models))
             .post("/v1/chat/completions", b(this::handleV1ChatCompletions))
@@ -227,6 +242,13 @@ public class ApiServer {
         System.out.printf("  POST /api/generate          http://localhost:%d/api/generate%n", port);
         System.out.printf("  POST /api/chat              http://localhost:%d/api/chat%n", port);
         System.out.printf("  POST /api/embeddings        http://localhost:%d/api/embeddings%n", port);
+        System.out.println();
+        System.out.println("Model management:");
+        System.out.printf("  POST /api/pull              http://localhost:%d/api/pull%n", port);
+        System.out.printf("  POST /api/create            http://localhost:%d/api/create%n", port);
+        System.out.printf("  POST /api/copy              http://localhost:%d/api/copy%n", port);
+        System.out.printf("  POST /api/delete            http://localhost:%d/api/delete%n", port);
+        System.out.printf("  POST /api/add               http://localhost:%d/api/add%n", port);
         System.out.println();
         System.out.println("OpenAI-compatible:");
         System.out.printf("  GET  /v1/models             http://localhost:%d/v1/models%n", port);
@@ -548,6 +570,339 @@ public class ApiServer {
             LOG.error("v1/embeddings failed for '{}'", modelName, e);
             if (!ex.isResponseStarted()) sendError(ex, 500, "embeddings failed: " + e.getMessage());
         }
+    }
+
+    // ── Management: POST /api/pull ────────────────────────────────────────────
+
+    /**
+     * Download a GGUF from HuggingFace and register it.
+     * Request: {@code {"name":"owner/repo/file.gguf","as":"alias","token":"hf_..."}}
+     * Response: NDJSON progress stream, final line: {@code {"status":"success","name":"..."}}
+     */
+    private void handleApiPull(HttpServerExchange ex) throws Exception {
+        JsonObject req = parseJson(ex);
+        if (!req.has("name")) { sendError(ex, 400, "\"name\" is required (format: owner/repo/file.gguf)"); return; }
+        String ref     = req.get("name").getAsString();
+        String hfToken = req.has("token") ? req.get("token").getAsString() : System.getenv("HF_TOKEN");
+        String alias   = req.has("as") && !req.get("as").isJsonNull() ? req.get("as").getAsString() : null;
+
+        // Parse owner/repo/file.gguf
+        int fs = ref.indexOf('/'), ss = fs >= 0 ? ref.indexOf('/', fs + 1) : -1;
+        if (fs < 0 || ss < 0) { sendError(ex, 400, "expected format: owner/repo/filename.gguf"); return; }
+        String owner    = ref.substring(0, fs);
+        String repo     = ref.substring(fs + 1, ss);
+        String filePath = ref.substring(ss + 1);
+        if (owner.isEmpty() || repo.isEmpty() || filePath.isEmpty()) {
+            sendError(ex, 400, "owner, repo and filename must not be empty"); return;
+        }
+
+        String fileName = filePath.contains("/") ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath;
+        String name = alias != null ? alias
+            : (fileName.toLowerCase(Locale.ROOT).endsWith(".gguf")
+               ? fileName.substring(0, fileName.length() - 5) : fileName);
+        Path dest = ModelRegistry.getManagedModelsDir().resolve(fileName);
+
+        beginNdjson(ex);
+        try (OutputStream os = ex.getOutputStream()) {
+            HuggingFaceClient hf = new HuggingFaceClient(hfToken);
+
+            if (Files.exists(dest)) {
+                writeNdjson(os, map("status", "already downloaded", "filename", fileName));
+            } else {
+                writeNdjson(os, map("status", "downloading", "filename", fileName,
+                    "repo", owner + "/" + repo));
+                final long[] lastPct = {-1};
+                final long[] lastMb  = {0};
+                try {
+                    hf.download(owner, repo, filePath, "main", dest, (dl, total) -> {
+                        try {
+                            if (total > 0) {
+                                long pct = dl * 100 / total;
+                                if (pct != lastPct[0]) {
+                                    lastPct[0] = pct;
+                                    writeNdjson(os, map("status", "downloading",
+                                        "completed", dl, "total", total));
+                                }
+                            } else {
+                                long mb = dl / (10L * 1024 * 1024); // report every 10 MB
+                                if (mb != lastMb[0]) {
+                                    lastMb[0] = mb;
+                                    writeNdjson(os, map("status", "downloading", "completed", dl));
+                                }
+                            }
+                        } catch (Exception ignored) {}
+                    });
+                } catch (Exception e) {
+                    writeNdjson(os, map("status", "error", "error", e.getMessage()));
+                    return;
+                }
+                writeNdjson(os, map("status", "download complete", "bytes", Files.size(dest)));
+            }
+
+            // Detect and download remaining shards for split models
+            SplitGguf.Split split = SplitGguf.detect(dest);
+            if (split != null && split.totalShards > 1) {
+                writeNdjson(os, map("status", "split model detected", "shards", split.totalShards));
+                List<String> remotePaths = SplitGguf.remoteShardPaths(filePath, split.totalShards);
+                for (int i = 0; i < split.totalShards; i++) {
+                    Path shardDest = split.shards.get(i);
+                    if (shardDest.toAbsolutePath().equals(dest.toAbsolutePath())) continue;
+                    if (Files.exists(shardDest)) {
+                        writeNdjson(os, map("status", "shard already downloaded", "shard", i + 1));
+                        continue;
+                    }
+                    final int shardNum = i + 1;
+                    writeNdjson(os, map("status", "downloading shard",
+                        "shard", shardNum, "of", split.totalShards));
+                    try {
+                        hf.download(owner, repo, remotePaths.get(i), "main", shardDest, null);
+                    } catch (Exception e) {
+                        writeNdjson(os, map("status", "error",
+                            "error", "shard " + shardNum + " failed: " + e.getMessage()));
+                        return;
+                    }
+                }
+                // Re-detect after all shards are present
+                split = SplitGguf.detect(dest);
+            }
+
+            writeNdjson(os, map("status", "registering", "name", name));
+            ModelConfig model = buildModelConfig(name, dest, split);
+            registry.add(model);
+            writeNdjson(os, map("status", "success", "name", name, "size", model.getSizeBytes()));
+        } catch (Exception e) {
+            LOG.error("api/pull failed", e);
+        }
+    }
+
+    // ── Management: POST /api/create ─────────────────────────────────────────
+
+    /**
+     * Create a model from an inline Modelfile string.
+     * Request: {@code {"name":"my-model","modelfile":"FROM /path/to/model.gguf\nSYSTEM ..."}}
+     * The FROM directive may also name a registered model (by name) instead of a file path.
+     */
+    private void handleApiCreate(HttpServerExchange ex) throws Exception {
+        JsonObject req = parseJson(ex);
+        if (!req.has("name") || !req.has("modelfile")) {
+            sendError(ex, 400, "\"name\" and \"modelfile\" are required"); return;
+        }
+        String name    = req.get("name").getAsString();
+        String content = req.get("modelfile").getAsString();
+        boolean stream = !req.has("stream") || req.get("stream").getAsBoolean();
+
+        ModelConfig model = new ModelConfig();
+        model.setName(name);
+        model.setFormat("gguf");
+        model.setAddedAt(Instant.now().toString());
+        Modelfile.apply(content, model);
+
+        if (model.getPath() == null || model.getPath().isEmpty()) {
+            sendError(ex, 400, "Modelfile must contain a FROM directive"); return;
+        }
+
+        Path modelPath = Paths.get(model.getPath());
+        if (!Files.exists(modelPath)) {
+            // FROM may reference a registered model name rather than a file path
+            ModelConfig src = registry.get(model.getPath()).orElse(null);
+            if (src == null) { sendError(ex, 400, "file not found: " + model.getPath()); return; }
+            model.setPath(src.getPath());
+            model.setShards(src.getShards());
+            model.setSizeBytes(src.getSizeBytes());
+            model.setGgufArchitecture(src.getGgufArchitecture());
+            model.setGgufQuantization(src.getGgufQuantization());
+            model.setGgufParameterCount(src.getGgufParameterCount());
+            model.setGgufContextLength(src.getGgufContextLength());
+            model.setGgufBlockCount(src.getGgufBlockCount());
+            model.setGgufEmbeddingLength(src.getGgufEmbeddingLength());
+        } else {
+            SplitGguf.Split split = SplitGguf.detect(modelPath);
+            applyShardInfoToModel(model, modelPath, split);
+            applyGgufMetadata(model, Paths.get(model.getPath()));
+        }
+
+        registry.add(model);
+
+        if (stream) {
+            beginNdjson(ex);
+            try (OutputStream os = ex.getOutputStream()) {
+                writeNdjson(os, map("status", "success"));
+            }
+        } else {
+            sendJson(ex, 200, map("name", name));
+        }
+    }
+
+    // ── Management: POST /api/copy ────────────────────────────────────────────
+
+    /**
+     * Copy a registry entry to a new name (no file duplication).
+     * Request: {@code {"source":"src-name","destination":"dst-name"}}
+     */
+    private void handleApiCopy(HttpServerExchange ex) throws Exception {
+        JsonObject req = parseJson(ex);
+        if (!req.has("source") || !req.has("destination")) {
+            sendError(ex, 400, "\"source\" and \"destination\" are required"); return;
+        }
+        String source      = req.get("source").getAsString();
+        String destination = req.get("destination").getAsString();
+
+        ModelConfig src = registry.get(source).orElse(null);
+        if (src == null) { sendError(ex, 404, "model '" + source + "' not found"); return; }
+
+        // Clone via JSON round-trip — ModelConfig is a plain POJO with no cycles.
+        ModelConfig dst = compactGson.fromJson(compactGson.toJson(src), ModelConfig.class);
+        dst.setName(destination);
+        dst.setAddedAt(Instant.now().toString());
+        registry.add(dst);
+
+        sendJson(ex, 200, map("source", source, "destination", destination));
+    }
+
+    // ── Management: POST /api/delete  or  DELETE /api/delete ─────────────────
+
+    /**
+     * Unregister a model.
+     * Request: {@code {"name":"model-name"}} — add {@code "purge":true} to also delete the GGUF file(s).
+     */
+    private void handleApiDelete(HttpServerExchange ex) throws Exception {
+        JsonObject req = parseJson(ex);
+        if (!req.has("name")) { sendError(ex, 400, "\"name\" is required"); return; }
+        String  name  = req.get("name").getAsString();
+        boolean purge = req.has("purge") && req.get("purge").getAsBoolean();
+
+        ModelConfig cfg = registry.get(name).orElse(null);
+        if (cfg == null) { sendError(ex, 404, "model '" + name + "' not found"); return; }
+
+        // Evict in-memory caches so the next request doesn't resurrect the entry.
+        loadedModels.remove(name);
+        batchSchedulers.entrySet().removeIf(e -> e.getKey().startsWith(name + "|"));
+
+        registry.remove(name);
+
+        if (purge) {
+            List<String> toDelete = cfg.isSplit()
+                ? cfg.getShards() : Collections.singletonList(cfg.getPath());
+            long freed = 0;
+            for (String s : toDelete) {
+                Path p = Paths.get(s);
+                if (Files.exists(p)) { freed += Files.size(p); Files.delete(p); }
+            }
+            sendJson(ex, 200, map("deleted", name, "purged", true, "freed_bytes", freed));
+        } else {
+            sendJson(ex, 200, map("deleted", name));
+        }
+    }
+
+    // ── Management: POST /api/add (jllm-specific) ─────────────────────────────
+
+    /**
+     * Register a model file already present on the server's filesystem.
+     * <pre>
+     * {
+     *   "name": "my-model",
+     *   "path": "/absolute/path/to/model.gguf",
+     *   "managed": false,          // if true, copy to ~/.local-llm/models/ first
+     *   "system": "...",           // optional Modelfile parameters
+     *   "temperature": 0.7,
+     *   "num_ctx": 4096,
+     *   "num_predict": 512,
+     *   "num_threads": 4,
+     *   "num_gpu_layers": 35
+     * }
+     * </pre>
+     */
+    private void handleApiAdd(HttpServerExchange ex) throws Exception {
+        JsonObject req = parseJson(ex);
+        if (!req.has("name") || !req.has("path")) {
+            sendError(ex, 400, "\"name\" and \"path\" are required"); return;
+        }
+        String  name    = req.get("name").getAsString();
+        String  rawPath = req.get("path").getAsString();
+        boolean managed = req.has("managed") && req.get("managed").getAsBoolean();
+
+        Path src = Paths.get(rawPath);
+        if (!Files.exists(src)) { sendError(ex, 400, "file not found: " + rawPath); return; }
+
+        if (managed) {
+            Files.createDirectories(ModelRegistry.getManagedModelsDir());
+            Path dst = ModelRegistry.getManagedModelsDir().resolve(src.getFileName());
+            if (!dst.toAbsolutePath().equals(src.toAbsolutePath())) {
+                Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING);
+                src = dst;
+            }
+        }
+
+        SplitGguf.Split split = SplitGguf.detect(src);
+        ModelConfig model = buildModelConfig(name, src, split);
+
+        if (req.has("system")        && !req.get("system").isJsonNull())
+            model.setSystemPrompt(req.get("system").getAsString());
+        if (req.has("temperature")   && !req.get("temperature").isJsonNull())
+            model.setTemperature(req.get("temperature").getAsFloat());
+        if (req.has("num_ctx")       && !req.get("num_ctx").isJsonNull())
+            model.setNumCtx(req.get("num_ctx").getAsInt());
+        if (req.has("num_predict")   && !req.get("num_predict").isJsonNull())
+            model.setNumPredict(req.get("num_predict").getAsInt());
+        if (req.has("num_threads")   && !req.get("num_threads").isJsonNull())
+            model.setNumThreads(req.get("num_threads").getAsInt());
+        if (req.has("num_gpu_layers") && !req.get("num_gpu_layers").isJsonNull())
+            model.setNumGpuLayers(req.get("num_gpu_layers").getAsInt());
+
+        registry.add(model);
+
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("name",  name);
+        r.put("path",  model.getPath());
+        r.put("size",  model.getSizeBytes());
+        if (model.isSplit())                    r.put("shards",       model.getShards().size());
+        if (model.getGgufQuantization() != null) r.put("quantization", model.getGgufQuantization());
+        if (model.getGgufParameterCount() != null) r.put("parameters", model.getGgufParameterCount());
+        sendJson(ex, 200, r);
+    }
+
+    // ── Management helpers ────────────────────────────────────────────────────
+
+    /**
+     * Build a fully-populated {@link ModelConfig} for {@code name} from a GGUF at
+     * {@code primaryPath}, handling split models via the pre-detected {@code split}.
+     */
+    private static ModelConfig buildModelConfig(String name, Path primaryPath,
+                                                SplitGguf.Split split) throws Exception {
+        ModelConfig model = new ModelConfig();
+        model.setName(name);
+        model.setFormat("gguf");
+        model.setAddedAt(Instant.now().toString());
+        applyShardInfoToModel(model, primaryPath, split);
+        applyGgufMetadata(model, Paths.get(model.getPath()));
+        return model;
+    }
+
+    private static void applyShardInfoToModel(ModelConfig model, Path primaryPath,
+                                              SplitGguf.Split split) throws Exception {
+        if (split != null && split.totalShards > 1) {
+            model.setPath(split.first().toString());
+            model.setShards(split.shards.stream().map(Path::toString).collect(Collectors.toList()));
+            long total = 0;
+            for (Path s : split.shards) { try { total += Files.size(s); } catch (Exception ignored) {} }
+            model.setSizeBytes(total);
+        } else {
+            model.setPath(primaryPath.toString());
+            model.setShards(null);
+            try { model.setSizeBytes(Files.size(primaryPath)); } catch (Exception ignored) {}
+        }
+    }
+
+    private static void applyGgufMetadata(ModelConfig model, Path path) {
+        try {
+            GgufReader.GgufMetadata m = GgufReader.read(path);
+            model.setGgufArchitecture(m.architecture);
+            model.setGgufQuantization(m.quantization);
+            model.setGgufParameterCount(m.parameterCount);
+            model.setGgufContextLength(m.contextLength);
+            model.setGgufBlockCount(m.blockCount);
+            model.setGgufEmbeddingLength(m.embeddingLength);
+        } catch (Exception ignored) {}
     }
 
     // ── OpenAI: GET /v1/models ────────────────────────────────────────────────

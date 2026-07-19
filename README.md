@@ -1020,6 +1020,11 @@ handlers — both Ollama and OpenAI endpoints.
 | `POST` | `/api/chat`             | Ollama  | Chat completion |
 | `POST` | `/api/embeddings`       | Ollama  | Text embeddings |
 | `GET`  | `/api/ps`               | Ollama  | Context pool stats and idle context count |
+| `POST` | `/api/pull`             | Management | Download from HuggingFace and register (NDJSON stream) |
+| `POST` | `/api/create`           | Management | Create model from inline Modelfile (NDJSON stream) |
+| `POST` | `/api/copy`             | Management | Copy a registry entry to a new name |
+| `POST/DELETE` | `/api/delete`  | Management | Unregister a model (optionally delete files) |
+| `POST` | `/api/add`              | jllm | Register a server-side local path |
 | `GET`  | `/v1/models`            | OpenAI  | List models |
 | `POST` | `/v1/chat/completions`  | OpenAI  | Chat completion |
 | `POST` | `/v1/completions`       | OpenAI  | Text completion |
@@ -1196,6 +1201,107 @@ curl http://localhost:11434/v1/chat/completions \
 - `tool_choice: "none"` disables tool injection entirely; `"auto"` (default) lets the model decide
 - When `tools` is present the response is always buffered (no token-by-token streaming) so that `<tool_call>` tags can be detected; streaming mode is still supported and emits the result as SSE once generation completes
 - If the model does not emit a tool call the response is returned as a normal chat completion
+
+### Model management API
+
+All management endpoints accept JSON bodies and return JSON. `/api/pull` returns NDJSON progress stream.
+
+#### `POST /api/pull` — Download from HuggingFace
+
+```bash
+# Download and register a specific file
+curl http://localhost:11434/api/pull \
+  -d '{
+    "name": "bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+    "as": "llama3.2:3b"
+  }'
+
+# With HuggingFace token (for gated models)
+curl http://localhost:11434/api/pull \
+  -d '{"name": "meta-llama/Meta-Llama-3-8B-Instruct-GGUF/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf", "token": "hf_..."}'
+```
+
+NDJSON progress stream:
+```
+{"status":"downloading","filename":"Llama-3.2-3B-Instruct-Q4_K_M.gguf","repo":"bartowski/Llama-3.2-3B-Instruct-GGUF"}
+{"status":"downloading","completed":10485760,"total":2147483648}
+...
+{"status":"download complete","bytes":2147483648}
+{"status":"registering","name":"llama3.2:3b"}
+{"status":"success","name":"llama3.2:3b","size":2147483648}
+```
+
+Split models (multiple `.gguf` shards) are detected and downloaded automatically.
+
+#### `POST /api/create` — Create from inline Modelfile
+
+```bash
+curl http://localhost:11434/api/create \
+  -d '{
+    "name": "assistant",
+    "modelfile": "FROM llama3.2:3b\nSYSTEM You are a concise assistant.\nPARAMETER temperature 0.5"
+  }'
+```
+
+`FROM` may be a registered model name **or** an absolute file path. Returns `{"status":"success"}`.
+
+#### `POST /api/copy` — Copy registry entry
+
+```bash
+curl http://localhost:11434/api/copy \
+  -d '{"source": "llama3.2:3b", "destination": "llama3.2:3b-backup"}'
+```
+
+Copies the registry entry (no file duplication). Returns `{"source":"...","destination":"..."}`.
+
+#### `POST /api/delete` — Unregister
+
+```bash
+# Unregister only (keep file on disk)
+curl -X POST http://localhost:11434/api/delete \
+  -d '{"name": "llama3.2:3b"}'
+
+# Unregister and delete the GGUF file(s)
+curl -X POST http://localhost:11434/api/delete \
+  -d '{"name": "llama3.2:3b", "purge": true}'
+
+# DELETE method also supported (Ollama-compatible)
+curl -X DELETE http://localhost:11434/api/delete \
+  -d '{"name": "llama3.2:3b"}'
+```
+
+Returns `{"deleted":"llama3.2:3b"}` (with `"freed_bytes"` when `purge: true`).
+
+#### `POST /api/add` — Register a local path (jllm-specific)
+
+Register a GGUF already present on the server's filesystem without downloading it.
+
+```bash
+curl http://localhost:11434/api/add \
+  -d '{
+    "name": "phi3:mini",
+    "path": "/data/models/Phi-3-mini-4k-instruct-q4.gguf",
+    "managed": false,
+    "system": "You are a helpful assistant.",
+    "temperature": 0.7,
+    "num_ctx": 4096,
+    "num_gpu_layers": 35
+  }'
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Registry name |
+| `path` | string | Absolute path to the GGUF file on the server |
+| `managed` | bool | Copy file to `~/.local-llm/models/` first (default: false) |
+| `system` | string | System prompt |
+| `temperature` | float | Generation temperature |
+| `num_ctx` | int | Context size |
+| `num_predict` | int | Max tokens |
+| `num_threads` | int | CPU threads |
+| `num_gpu_layers` | int | GPU offload layers |
+
+Returns metadata including GGUF quantization and parameter count if readable.
 
 ### Ollama: `POST /api/show` — Model details
 
