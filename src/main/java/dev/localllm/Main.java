@@ -542,17 +542,50 @@ public class Main {
     }
 
     private static void cmdServe(String[] args) throws Exception {
-        int port = 11434;
+        int port          = 11434;
         int maxConcurrent = Runtime.getRuntime().availableProcessors();
+        ApiServer.ServerConfig cfg = new ApiServer.ServerConfig();
+
         for (int i = 1; i < args.length; i++) {
-            if ("--port".equals(args[i]) && i + 1 < args.length) {
-                port = Integer.parseInt(args[++i]);
-            } else if ("--max-concurrent".equals(args[i]) && i + 1 < args.length) {
-                maxConcurrent = Integer.parseInt(args[++i]);
+            switch (args[i]) {
+                case "--port":
+                    if (i + 1 < args.length) port = Integer.parseInt(args[++i]);
+                    break;
+                case "--max-concurrent":
+                    if (i + 1 < args.length) maxConcurrent = Integer.parseInt(args[++i]);
+                    break;
+                case "--max-body":
+                    if (i + 1 < args.length) cfg.maxBodyBytes = parseBytes(args[++i]);
+                    break;
+                case "--max-tokens":
+                    if (i + 1 < args.length) cfg.maxOutputTokens = Integer.parseInt(args[++i]);
+                    break;
+                case "--rate-limit":
+                    if (i + 1 < args.length) cfg.rateLimitPerMinute = Integer.parseInt(args[++i]);
+                    break;
             }
         }
         System.out.println("Starting local-llm server on http://localhost:" + port);
-        new ApiServer(port, registry, plugins, ragManager, maxConcurrent).start();
+        new ApiServer(port, registry, plugins, ragManager, maxConcurrent, cfg).start();
+    }
+
+    /**
+     * Parse a byte count that may have an optional suffix: {@code K}, {@code M}, {@code G}
+     * (case-insensitive). Examples: {@code 4M} → 4194304, {@code 512K} → 524288.
+     */
+    private static int parseBytes(String s) {
+        s = s.trim();
+        char last = s.charAt(s.length() - 1);
+        int multiplier = 1;
+        if (Character.isLetter(last)) {
+            switch (Character.toUpperCase(last)) {
+                case 'K': multiplier = 1024;           break;
+                case 'M': multiplier = 1024 * 1024;    break;
+                case 'G': multiplier = 1024 * 1024 * 1024; break;
+            }
+            s = s.substring(0, s.length() - 1);
+        }
+        return Integer.parseInt(s.trim()) * multiplier;
     }
 
     /**
@@ -1557,6 +1590,9 @@ public class Main {
         System.out.println("             (stdin pipe auto-detected: echo \"...\" | jllm run <name>)");
         System.out.println("  serve [--port <port>]                   Start the HTTP server (default: 11434)");
         System.out.println("        [--max-concurrent <n>]            Max parallel inference slots (default: CPU count)");
+        System.out.println("        [--max-body <bytes>]              Max request body size, e.g. 4M (default: 4M)");
+        System.out.println("        [--max-tokens <n>]               Server-side output token cap, 0=off (default: 0)");
+        System.out.println("        [--rate-limit <req/min>]          Per-IP rate limit, 0=off (default: 0)");
         System.out.println("  rag add <collection> <path>             Index a file or directory for RAG");
         System.out.println("  rag list                                List RAG collections");
         System.out.println("  rag search <collection> <query>         Test RAG retrieval");

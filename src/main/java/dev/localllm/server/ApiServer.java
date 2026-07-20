@@ -26,6 +26,8 @@ import io.undertow.util.HttpString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -38,6 +40,7 @@ import java.util.Locale;
 import java.util.stream.Collectors;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +49,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -91,6 +95,11 @@ public class ApiServer {
     private static final int   DEFAULT_CHAT_PREDICT  = 500;
     private static final int   DEFAULT_MAX_CONCURRENT = Runtime.getRuntime().availableProcessors();
 
+    // Safety defaults (overridden via ServerConfig / CLI flags)
+    static final int DEFAULT_MAX_BODY_BYTES   = 4 * 1024 * 1024; // 4 MB
+    static final int DEFAULT_MAX_OUTPUT_TOKENS = 0;               // 0 = no cap
+    static final int DEFAULT_RATE_LIMIT_PER_MIN = 0;              // 0 = disabled
+
     // Matches the <tool_call>{...}</tool_call> tag the model emits for function calling.
     private static final Pattern TOOL_CALL_RE =
         Pattern.compile("<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>", Pattern.DOTALL);
@@ -110,6 +119,9 @@ public class ApiServer {
     private final PluginManager plugins;
     private final RagManager ragManager;
     private final int maxConcurrent;
+    private final int maxBodyBytes;
+    private final int maxOutputTokens;
+    private final IpRateLimiter rateLimiter; // null = disabled
 
     // Each HTTP request runs on its own virtual thread (Java 21+) or daemon
     // platform thread (Java < 21). Switching from BlockingHandler's default
@@ -132,24 +144,33 @@ public class ApiServer {
     private final Gson compactGson;
 
     public ApiServer(int port, ModelRegistry registry) {
-        this(port, registry, PluginManager.EMPTY, null, DEFAULT_MAX_CONCURRENT);
+        this(port, registry, PluginManager.EMPTY, null, DEFAULT_MAX_CONCURRENT, new ServerConfig());
     }
 
     public ApiServer(int port, ModelRegistry registry, PluginManager plugins) {
-        this(port, registry, plugins, null, DEFAULT_MAX_CONCURRENT);
+        this(port, registry, plugins, null, DEFAULT_MAX_CONCURRENT, new ServerConfig());
     }
 
     public ApiServer(int port, ModelRegistry registry, PluginManager plugins, int maxConcurrent) {
-        this(port, registry, plugins, null, maxConcurrent);
+        this(port, registry, plugins, null, maxConcurrent, new ServerConfig());
     }
 
     public ApiServer(int port, ModelRegistry registry, PluginManager plugins,
                      RagManager ragManager, int maxConcurrent) {
+        this(port, registry, plugins, ragManager, maxConcurrent, new ServerConfig());
+    }
+
+    public ApiServer(int port, ModelRegistry registry, PluginManager plugins,
+                     RagManager ragManager, int maxConcurrent, ServerConfig cfg) {
         this.port               = port;
         this.registry           = registry;
         this.plugins            = plugins != null ? plugins : PluginManager.EMPTY;
         this.ragManager         = ragManager;
         this.maxConcurrent      = maxConcurrent;
+        this.maxBodyBytes       = cfg.maxBodyBytes;
+        this.maxOutputTokens    = cfg.maxOutputTokens;
+        this.rateLimiter        = cfg.rateLimitPerMinute > 0
+                                  ? new IpRateLimiter(cfg.rateLimitPerMinute) : null;
         this.requestExecutor    = createExecutor();
         this.inferenceSemaphore = new Semaphore(maxConcurrent);
         this.contextPool        = new ContextPool(maxConcurrent);
@@ -235,6 +256,12 @@ public class ApiServer {
         }
         System.out.printf("Max concurrent   : %d inference slot(s) (--max-concurrent to change)%n", maxConcurrent);
         System.out.printf("Context pool     : enabled — up to %d idle context(s) per model config%n", maxConcurrent);
+        System.out.printf("Max body         : %s (--max-body to change)%n", formatBytes(maxBodyBytes));
+        System.out.printf("Max output tokens: %s (--max-tokens to change)%n",
+            maxOutputTokens > 0 ? String.valueOf(maxOutputTokens) : "unlimited");
+        System.out.printf("Rate limit       : %s%n",
+            rateLimiter != null ? rateLimiter.limit + " req/min per IP (--rate-limit to change)"
+                                : "disabled (--rate-limit to enable)");
         System.out.println();
         System.out.println("Ollama-compatible:");
         System.out.printf("  GET  /api/tags              http://localhost:%d/api/tags%n", port);
@@ -273,14 +300,44 @@ public class ApiServer {
             if (exchange.isInIoThread()) {
                 exchange.dispatch(requestExecutor, () -> {
                     exchange.startBlocking();
-                    try { h.handleRequest(exchange); }
-                    catch (Exception e) { LOG.error("Handler error", e); }
+                    try {
+                        if (checkRateLimit(exchange)) h.handleRequest(exchange);
+                    } catch (HandledRequestException ignored) {
+                        // response already sent inside the handler
+                    } catch (Exception e) {
+                        LOG.error("Handler error", e);
+                    }
                 });
             } else {
                 exchange.startBlocking();
-                h.handleRequest(exchange);
+                try {
+                    if (checkRateLimit(exchange)) h.handleRequest(exchange);
+                } catch (HandledRequestException ignored) {
+                } catch (Exception e) {
+                    LOG.error("Handler error", e);
+                }
             }
         };
+    }
+
+    /**
+     * Check the per-IP rate limit. Returns true if the request is allowed,
+     * sends HTTP 429 and returns false if the IP is over the limit.
+     */
+    private boolean checkRateLimit(HttpServerExchange ex) throws Exception {
+        if (rateLimiter == null) return true;
+        String ip = ex.getSourceAddress().getAddress().getHostAddress();
+        if (rateLimiter.allow(ip)) return true;
+        ex.getResponseHeaders()
+            .put(Headers.CONTENT_TYPE, "application/json")
+            .put(new HttpString("Retry-After"), "60");
+        ex.setStatusCode(429);
+        byte[] body = ("{\"error\":\"rate limit exceeded: max " + rateLimiter.limit
+            + " requests/min per IP\"}")
+            .getBytes(StandardCharsets.UTF_8);
+        ex.setResponseContentLength(body.length);
+        ex.getOutputStream().write(body);
+        return false;
     }
 
     /**
@@ -412,6 +469,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
+        opts.numPredict = capTokens(opts.numPredict);
         String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
         String effectiveSystem = ragEnhancedSystem(ragCollection, prompt, cfg.getSystemPrompt());
         String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(effectiveSystem, prompt));
@@ -451,6 +509,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
+        opts.numPredict = capTokens(opts.numPredict);
         String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
         String ragQuery = lastUserMessage(messages);
         String effectiveSystem = ragEnhancedSystem(ragCollection, ragQuery, cfg.getSystemPrompt());
@@ -943,6 +1002,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
+        opts.numPredict = capTokens(opts.numPredict);
         String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
         String effectiveSystem = ragEnhancedSystem(ragCollection, lastUserMessage(messages), cfg.getSystemPrompt());
 
@@ -1030,6 +1090,7 @@ public class ApiServer {
         LlamaModel model = loadModel(ex, cfg);         if (model == null) return;
 
         opts.applyModelDefaults(cfg);
+        opts.numPredict = capTokens(opts.numPredict);
         String ragCollection = req.has("rag_collection") ? req.get("rag_collection").getAsString() : null;
         String ragSystem = ragEnhancedSystem(ragCollection, prompt, cfg.getSystemPrompt());
         String effectivePrompt = plugins.applyInterceptors(withSystemPrompt(ragSystem, prompt));
@@ -1095,8 +1156,36 @@ public class ApiServer {
     // ── HTTP I/O helpers ──────────────────────────────────────────────────────
 
     private JsonObject parseJson(HttpServerExchange ex) throws Exception {
-        String body = new String(ex.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        return prettyGson.fromJson(body, JsonObject.class);
+        // Fast-reject: Content-Length header already exceeds limit
+        long cl = ex.getRequestContentLength();
+        if (cl > maxBodyBytes) {
+            sendError(ex, 413, "request body too large: " + cl
+                + " bytes (limit: " + formatBytes(maxBodyBytes) + ")");
+            throw new HandledRequestException();
+        }
+        // Hard cap on actual bytes read (covers chunked transfer without Content-Length)
+        byte[] raw = readBodyLimited(ex.getInputStream(), maxBodyBytes);
+        if (raw == null) {
+            sendError(ex, 413, "request body too large (limit: " + formatBytes(maxBodyBytes) + ")");
+            throw new HandledRequestException();
+        }
+        return prettyGson.fromJson(new String(raw, StandardCharsets.UTF_8), JsonObject.class);
+    }
+
+    /**
+     * Read at most {@code limit} bytes from {@code in}.
+     * Returns the bytes on success, or {@code null} if the stream exceeds {@code limit}.
+     */
+    private static byte[] readBodyLimited(InputStream in, int limit) throws Exception {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(Math.min(limit, 65536));
+        byte[] chunk = new byte[8192];
+        int total = 0, n;
+        while ((n = in.read(chunk)) != -1) {
+            total += n;
+            if (total > limit) return null;
+            baos.write(chunk, 0, n);
+        }
+        return baos.toByteArray();
     }
 
     private void sendJson(HttpServerExchange ex, int status, Object obj) throws Exception {
@@ -1109,6 +1198,11 @@ public class ApiServer {
 
     private void sendError(HttpServerExchange ex, int status, String message) throws Exception {
         sendJson(ex, status, map("error", message));
+    }
+
+    /** Clamp token count to server-configured maximum (0 = no cap). */
+    private int capTokens(int n) {
+        return (maxOutputTokens > 0) ? Math.min(n, maxOutputTokens) : n;
     }
 
     private void beginNdjson(HttpServerExchange ex) {
@@ -1529,6 +1623,12 @@ public class ApiServer {
         return (Map<K, V>) m;
     }
 
+    private static String formatBytes(long bytes) {
+        if (bytes >= 1024 * 1024) return String.format("%.0f MB", bytes / (1024.0 * 1024));
+        if (bytes >= 1024)        return String.format("%.0f KB", bytes / 1024.0);
+        return bytes + " B";
+    }
+
     private static long epochOf(String isoInstant) {
         if (isoInstant == null) return Instant.now().getEpochSecond();
         try { return Instant.parse(isoInstant).getEpochSecond(); }
@@ -1537,6 +1637,80 @@ public class ApiServer {
 
     private static String shortUuid() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+    }
+
+    // ── Server configuration ──────────────────────────────────────────────────
+
+    /** Configurable safety limits passed to the ApiServer constructor. */
+    public static final class ServerConfig {
+        /** Maximum request body size in bytes (default 4 MB). */
+        public int maxBodyBytes      = DEFAULT_MAX_BODY_BYTES;
+        /** Server-side cap on output tokens; 0 = no cap. */
+        public int maxOutputTokens   = DEFAULT_MAX_OUTPUT_TOKENS;
+        /** Max requests per minute per client IP; 0 = rate limiting disabled. */
+        public int rateLimitPerMinute = DEFAULT_RATE_LIMIT_PER_MIN;
+    }
+
+    // ── Rate limiter ──────────────────────────────────────────────────────────
+
+    /**
+     * Per-IP fixed-window rate limiter.
+     *
+     * <p>Each IP gets a one-minute window. The first request in a window starts the
+     * clock; subsequent requests within the same window are counted. Requests beyond
+     * {@link #limit} in a window are rejected with HTTP 429.
+     *
+     * <p>The internal map is bounded: when it exceeds 50 000 entries a full sweep
+     * evicts all entries whose window has already expired so memory stays bounded
+     * even under a large number of distinct client IPs.
+     */
+    static final class IpRateLimiter {
+        final int limit;
+        private static final long WINDOW_MS = 60_000L;
+        private static final int  EVICT_THRESHOLD = 50_000;
+
+        // Value: long[2] = { windowStartMs, count }
+        private final ConcurrentHashMap<String, long[]> state = new ConcurrentHashMap<>();
+
+        IpRateLimiter(int limit) { this.limit = limit; }
+
+        /** Returns true if the request should be allowed, false if rate-limited. */
+        boolean allow(String ip) {
+            long now = System.currentTimeMillis();
+            long[] slot = state.computeIfAbsent(ip, k -> new long[]{now, 0L});
+            synchronized (slot) {
+                if (now - slot[0] >= WINDOW_MS) {
+                    // New window: reset counter and evict stale entries if needed.
+                    slot[0] = now;
+                    slot[1] = 0;
+                    if (state.size() > EVICT_THRESHOLD) evictExpired(now);
+                }
+                if (slot[1] >= limit) return false;
+                slot[1]++;
+                return true;
+            }
+        }
+
+        private void evictExpired(long now) {
+            Iterator<Map.Entry<String, long[]>> it = state.entrySet().iterator();
+            while (it.hasNext()) {
+                long[] s = it.next().getValue();
+                if (now - s[0] >= WINDOW_MS) it.remove();
+            }
+        }
+
+        /** Approximate seconds until the current window resets for any IP. */
+        int retryAfterSeconds() { return 60; }
+    }
+
+    // ── Sentinel exception ────────────────────────────────────────────────────
+
+    /**
+     * Thrown inside a handler after it has already written the error response,
+     * so the {@code b()} wrapper knows not to log it as an unexpected error.
+     */
+    private static final class HandledRequestException extends RuntimeException {
+        HandledRequestException() { super(null, null, true, false); }
     }
 
     // ── Generation options ────────────────────────────────────────────────────

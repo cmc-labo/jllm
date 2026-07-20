@@ -301,12 +301,16 @@ jllm show phi3:mini --yaml     # Jllmfile (YAML) format
 jllm serve
 jllm serve --port 8080
 jllm serve --max-concurrent 4
+jllm serve --max-tokens 2048 --rate-limit 30 --max-body 1M
 ```
 
 | Flag | Description |
 |---|---|
 | `--port <port>` | Port to listen on (default: `11434`) |
 | `--max-concurrent <n>` | Maximum simultaneous inference slots (default: CPU core count). Also controls the number of concurrent sequences in the continuous-batch scheduler. |
+| `--max-body <bytes>` | Maximum request body size. Accepts suffix: `K`, `M`, `G` (e.g. `4M`). Default: `4M`. Requests larger than this are rejected with HTTP 413. |
+| `--max-tokens <n>` | Server-side cap on output tokens per request. Overrides (clamps) per-request `num_predict` / `max_tokens`. `0` = no cap (default). Useful to prevent runaway generation from long `num_predict` requests. |
+| `--rate-limit <req/min>` | Per-IP rate limit: maximum requests per minute from a single IP address. Excess requests are rejected with HTTP 429 and a `Retry-After: 60` header. `0` = disabled (default). Uses a fixed-window counter; the limit resets every 60 seconds. |
 
 On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project Loom) — created instantly, with no OS thread per connection. On **Java 11–20**, a cached platform thread pool is used instead.
 
