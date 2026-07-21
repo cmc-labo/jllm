@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -50,6 +51,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -140,6 +142,7 @@ public class ApiServer {
     private final Map<String, LlamaModel> loadedModels = new ConcurrentHashMap<>();
     // One BatchScheduler per unique (model, nCtx, nThreads) configuration.
     private final Map<String, BatchScheduler> batchSchedulers = new ConcurrentHashMap<>();
+    private final MetricsCollector metrics = new MetricsCollector();
     private final Gson prettyGson;
     private final Gson compactGson;
 
@@ -221,6 +224,9 @@ public class ApiServer {
         HttpHandler router = Handlers.routing()
             // root info
             .get("/",                     b(this::handleRoot))
+            // ── Observability ─────────────────────────────────────────────────
+            .get("/health",               b(this::handleHealth))
+            .get("/metrics",              b(this::handleMetrics))
             // ── Ollama API ────────────────────────────────────────────────────
             .get("/api/tags",             b(this::handleTags))
             .get("/api/ps",               b(this::handlePs))
@@ -263,6 +269,10 @@ public class ApiServer {
             rateLimiter != null ? rateLimiter.limit + " req/min per IP (--rate-limit to change)"
                                 : "disabled (--rate-limit to enable)");
         System.out.println();
+        System.out.println("Observability:");
+        System.out.printf("  GET  /health                http://localhost:%d/health%n", port);
+        System.out.printf("  GET  /metrics               http://localhost:%d/metrics%n", port);
+        System.out.println();
         System.out.println("Ollama-compatible:");
         System.out.printf("  GET  /api/tags              http://localhost:%d/api/tags%n", port);
         System.out.printf("  POST /api/show              http://localhost:%d/api/show%n", port);
@@ -300,24 +310,36 @@ public class ApiServer {
             if (exchange.isInIoThread()) {
                 exchange.dispatch(requestExecutor, () -> {
                     exchange.startBlocking();
+                    long start = System.nanoTime();
                     try {
                         if (checkRateLimit(exchange)) h.handleRequest(exchange);
                     } catch (HandledRequestException ignored) {
                         // response already sent inside the handler
                     } catch (Exception e) {
                         LOG.error("Handler error", e);
+                    } finally {
+                        metrics.record(pathToLabel(exchange.getRequestPath()),
+                                       exchange.getStatusCode(), System.nanoTime() - start);
                     }
                 });
             } else {
                 exchange.startBlocking();
+                long start = System.nanoTime();
                 try {
                     if (checkRateLimit(exchange)) h.handleRequest(exchange);
                 } catch (HandledRequestException ignored) {
                 } catch (Exception e) {
                     LOG.error("Handler error", e);
+                } finally {
+                    metrics.record(pathToLabel(exchange.getRequestPath()),
+                                   exchange.getStatusCode(), System.nanoTime() - start);
                 }
             }
         };
+    }
+
+    private static String pathToLabel(String path) {
+        return path.replaceFirst("^/", "").replace('/', '_').replace('-', '_');
     }
 
     /**
@@ -328,6 +350,7 @@ public class ApiServer {
         if (rateLimiter == null) return true;
         String ip = ex.getSourceAddress().getAddress().getHostAddress();
         if (rateLimiter.allow(ip)) return true;
+        metrics.recordRateLimited();
         ex.getResponseHeaders()
             .put(Headers.CONTENT_TYPE, "application/json")
             .put(new HttpString("Retry-After"), "60");
@@ -1161,12 +1184,14 @@ public class ApiServer {
         if (cl > maxBodyBytes) {
             sendError(ex, 413, "request body too large: " + cl
                 + " bytes (limit: " + formatBytes(maxBodyBytes) + ")");
+            metrics.recordBodyTooLarge();
             throw new HandledRequestException();
         }
         // Hard cap on actual bytes read (covers chunked transfer without Content-Length)
         byte[] raw = readBodyLimited(ex.getInputStream(), maxBodyBytes);
         if (raw == null) {
             sendError(ex, 413, "request body too large (limit: " + formatBytes(maxBodyBytes) + ")");
+            metrics.recordBodyTooLarge();
             throw new HandledRequestException();
         }
         return prettyGson.fromJson(new String(raw, StandardCharsets.UTF_8), JsonObject.class);
@@ -1265,20 +1290,21 @@ public class ApiServer {
                                String prompt, int nPredict, float temperature,
                                int nCtx, int nThreads,
                                TokenSink sink) throws Exception {
+        TokenSink countingSink = piece -> { metrics.recordToken(); sink.accept(piece); };
         if (LlamaModel.isNativeLibraryAvailable()) {
             BatchScheduler sched = getOrCreateScheduler(model, modelName, nCtx, nThreads);
             int[] tokens = model.tokenize(prompt, true, true);
             BatchScheduler.Sequence seq = sched.submit(tokens, nPredict, temperature);
             String piece;
             while ((piece = seq.nextPiece()) != null) {
-                sink.accept(piece);
+                countingSink.accept(piece);
             }
         } else {
             inferenceSemaphore.acquire();
             LlamaContext ctx = contextPool.acquire(model, modelName, nCtx, nThreads);
             try {
                 try (LlamaContext.TokenStream ts = ctx.generateTokens(prompt, nPredict, temperature)) {
-                    for (String piece : ts) sink.accept(piece);
+                    for (String piece : ts) countingSink.accept(piece);
                 }
             } finally {
                 contextPool.release(modelName, nCtx, nThreads, ctx);
@@ -1614,6 +1640,146 @@ public class ApiServer {
         return r;
     }
 
+    // ── GET /health ───────────────────────────────────────────────────────────
+
+    private void handleHealth(HttpServerExchange ex) throws Exception {
+        Runtime rt = Runtime.getRuntime();
+        long heapUsed  = rt.totalMemory() - rt.freeMemory();
+        long heapMax   = rt.maxMemory();
+        long uptimeSec = (System.currentTimeMillis() - metrics.startMs) / 1000;
+        int  slotsAvail = inferenceSemaphore.availablePermits();
+        ContextPool.PoolStats ps = contextPool.stats();
+
+        sendJson(ex, 200, map(
+            "status",          slotsAvail == 0 && maxConcurrent > 0 ? "busy" : "ok",
+            "uptime_seconds",  uptimeSec,
+            "loaded_models",   loadedModels.size(),
+            "inference_slots", map(
+                "active",    maxConcurrent - slotsAvail,
+                "available", slotsAvail,
+                "max",       maxConcurrent
+            ),
+            "context_pool", map(
+                "idle",     ps.totalIdle,
+                "hit_rate", String.format("%.1f%%", ps.hitRate())
+            ),
+            "jvm", map(
+                "heap_used_bytes", heapUsed,
+                "heap_max_bytes",  heapMax,
+                "heap_used_mb",    heapUsed / (1024 * 1024),
+                "heap_max_mb",     heapMax  / (1024 * 1024),
+                "threads",         ManagementFactory.getThreadMXBean().getThreadCount()
+            )
+        ));
+    }
+
+    // ── GET /metrics (Prometheus text format) ─────────────────────────────────
+
+    private void handleMetrics(HttpServerExchange ex) throws Exception {
+        StringBuilder sb = new StringBuilder(8192);
+        long uptimeSec = (System.currentTimeMillis() - metrics.startMs) / 1000;
+        Runtime rt = Runtime.getRuntime();
+        long heapUsed  = rt.totalMemory() - rt.freeMemory();
+        long heapMax   = rt.maxMemory();
+        ContextPool.PoolStats ps = contextPool.stats();
+        int slotsAvail = inferenceSemaphore.availablePermits();
+
+        // uptime
+        promMetric(sb, "jllm_uptime_seconds", "gauge", "Server uptime in seconds", uptimeSec);
+
+        // tokens / rejections
+        promMetric(sb, "jllm_tokens_generated_total", "counter",
+            "Total output tokens generated across all requests", metrics.tokensTotal.sum());
+        promMetric(sb, "jllm_rate_limit_rejected_total", "counter",
+            "Requests rejected by the per-IP rate limiter", metrics.rateLimitedTotal.sum());
+        promMetric(sb, "jllm_body_too_large_total", "counter",
+            "Requests rejected because the body exceeded --max-body", metrics.bodyTooLargeTotal.sum());
+
+        // inference slots
+        promMetric(sb, "jllm_inference_slots_active", "gauge",
+            "Inference slots currently occupied", maxConcurrent - slotsAvail);
+        promMetric(sb, "jllm_inference_slots_total", "gauge",
+            "Total configured inference slots (--max-concurrent)", maxConcurrent);
+
+        // context pool
+        promMetric(sb, "jllm_context_pool_hits_total",      "counter",
+            "Context pool cache hits (KV cache reused)",      ps.hits);
+        promMetric(sb, "jllm_context_pool_misses_total",    "counter",
+            "Context pool cache misses (new context created)", ps.misses);
+        promMetric(sb, "jllm_context_pool_evictions_total", "counter",
+            "Context pool evictions",                          ps.evictions);
+        promMetric(sb, "jllm_context_pool_idle",            "gauge",
+            "Idle contexts in the pool",                       ps.totalIdle);
+
+        // loaded models
+        promMetric(sb, "jllm_models_loaded", "gauge",
+            "Number of model weights currently loaded in memory", loadedModels.size());
+
+        // per-model batch scheduler gauges
+        if (!batchSchedulers.isEmpty()) {
+            sb.append("# HELP jllm_batch_active_sequences Active sequences in the batch scheduler\n");
+            sb.append("# TYPE jllm_batch_active_sequences gauge\n");
+            sb.append("# HELP jllm_batch_pending_requests Pending requests in the batch scheduler\n");
+            sb.append("# TYPE jllm_batch_pending_requests gauge\n");
+            batchSchedulers.forEach((key, sched) -> {
+                String model = key.split("\\|", 2)[0].replace("\"", "\\\"");
+                sb.append("jllm_batch_active_sequences{model=\"").append(model).append("\"} ")
+                  .append(sched.activeSequences()).append('\n');
+                sb.append("jllm_batch_pending_requests{model=\"").append(model).append("\"} ")
+                  .append(sched.pendingRequests()).append('\n');
+            });
+        }
+
+        // JVM memory / threads
+        promMetric(sb, "jllm_jvm_heap_used_bytes", "gauge",
+            "JVM heap bytes currently used", heapUsed);
+        promMetric(sb, "jllm_jvm_heap_max_bytes", "gauge",
+            "JVM heap maximum bytes (-Xmx)", heapMax);
+        promMetric(sb, "jllm_jvm_threads", "gauge",
+            "JVM thread count", ManagementFactory.getThreadMXBean().getThreadCount());
+
+        // per-endpoint request counters + duration histogram
+        if (!metrics.endpoints.isEmpty()) {
+            sb.append("# HELP jllm_requests_total HTTP requests total by endpoint and status class\n");
+            sb.append("# TYPE jllm_requests_total counter\n");
+            metrics.endpoints.forEach((ep, ec) -> {
+                sb.append("jllm_requests_total{endpoint=\"").append(ep).append("\",status=\"2xx\"} ")
+                  .append(ec.ok.sum()).append('\n');
+                sb.append("jllm_requests_total{endpoint=\"").append(ep).append("\",status=\"4xx\"} ")
+                  .append(ec.clientErr.sum()).append('\n');
+                sb.append("jllm_requests_total{endpoint=\"").append(ep).append("\",status=\"5xx\"} ")
+                  .append(ec.serverErr.sum()).append('\n');
+            });
+
+            sb.append("# HELP jllm_request_duration_seconds HTTP request latency histogram\n");
+            sb.append("# TYPE jllm_request_duration_seconds histogram\n");
+            metrics.endpoints.forEach((ep, ec) -> {
+                for (int i = 0; i < MetricsCollector.HIST_LE.length; i++) {
+                    sb.append("jllm_request_duration_seconds_bucket{endpoint=\"").append(ep)
+                      .append("\",le=\"").append(MetricsCollector.HIST_LE[i]).append("\"} ")
+                      .append(ec.buckets[i].sum()).append('\n');
+                }
+                sb.append("jllm_request_duration_seconds_sum{endpoint=\"").append(ep).append("\"} ")
+                  .append(String.format("%.6f", ec.durationNsSum.sum() / 1_000_000_000.0)).append('\n');
+                sb.append("jllm_request_duration_seconds_count{endpoint=\"").append(ep).append("\"} ")
+                  .append(ec.total.sum()).append('\n');
+            });
+        }
+
+        byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().put(Headers.CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8");
+        ex.setStatusCode(200);
+        ex.setResponseContentLength(body.length);
+        ex.getOutputStream().write(body);
+    }
+
+    private static void promMetric(StringBuilder sb, String name, String type,
+                                   String help, long value) {
+        sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        sb.append("# TYPE ").append(name).append(' ').append(type).append('\n');
+        sb.append(name).append(' ').append(value).append('\n');
+    }
+
     // ── Misc helpers ──────────────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
@@ -1637,6 +1803,58 @@ public class ApiServer {
 
     private static String shortUuid() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+    }
+
+    // ── Metrics collector ─────────────────────────────────────────────────────
+
+    /** Thread-safe request counters and latency histograms for /metrics output. */
+    static final class MetricsCollector {
+
+        // Histogram bucket upper bounds in nanoseconds (last = +Inf sentinel, excluded from HIST_BUCKET_NS)
+        static final long[]   HIST_BUCKET_NS = {
+            50_000_000L, 100_000_000L, 250_000_000L, 500_000_000L,
+            1_000_000_000L, 5_000_000_000L, 30_000_000_000L
+        };
+        static final String[] HIST_LE = {"0.05","0.1","0.25","0.5","1","5","30","+Inf"};
+
+        final long startMs = System.currentTimeMillis();
+
+        static final class EndpointCounter {
+            final LongAdder total        = new LongAdder();
+            final LongAdder ok           = new LongAdder();   // 2xx
+            final LongAdder clientErr    = new LongAdder();   // 4xx
+            final LongAdder serverErr    = new LongAdder();   // 5xx
+            final LongAdder durationNsSum = new LongAdder();
+            // Cumulative histogram buckets; length == HIST_LE.length (+Inf always 1:1 with total)
+            final LongAdder[] buckets    = new LongAdder[HIST_LE.length];
+            { for (int i = 0; i < buckets.length; i++) buckets[i] = new LongAdder(); }
+
+            void record(int status, long durationNs) {
+                total.increment();
+                if      (status >= 500) serverErr.increment();
+                else if (status >= 400) clientErr.increment();
+                else                    ok.increment();
+                durationNsSum.add(durationNs);
+                // Prometheus histograms are cumulative: bucket[i] = count of requests <= threshold
+                for (int i = 0; i < HIST_BUCKET_NS.length; i++) {
+                    if (durationNs <= HIST_BUCKET_NS[i]) buckets[i].increment();
+                }
+                buckets[buckets.length - 1].increment(); // +Inf = total
+            }
+        }
+
+        final ConcurrentHashMap<String, EndpointCounter> endpoints = new ConcurrentHashMap<>();
+        final LongAdder tokensTotal       = new LongAdder();
+        final LongAdder rateLimitedTotal  = new LongAdder();
+        final LongAdder bodyTooLargeTotal = new LongAdder();
+
+        void record(String endpoint, int status, long durationNs) {
+            endpoints.computeIfAbsent(endpoint, k -> new EndpointCounter()).record(status, durationNs);
+        }
+
+        void recordToken()        { tokensTotal.increment(); }
+        void recordRateLimited()  { rateLimitedTotal.increment(); }
+        void recordBodyTooLarge() { bodyTooLargeTotal.increment(); }
     }
 
     // ── Server configuration ──────────────────────────────────────────────────

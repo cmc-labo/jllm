@@ -1018,6 +1018,8 @@ handlers — both Ollama and OpenAI endpoints.
 
 | Method | Path | Protocol | Description |
 |---|---|---|---|
+| `GET`  | `/health`               | —       | Liveness check (status, uptime, slots, JVM) |
+| `GET`  | `/metrics`              | —       | Prometheus text-format metrics |
 | `GET`  | `/api/tags`             | Ollama  | List registered models |
 | `POST` | `/api/show`             | Ollama  | Model details (Modelfile + parameters) |
 | `POST` | `/api/generate`         | Ollama  | Text generation |
@@ -1376,6 +1378,104 @@ In fallback (no JNI) mode:
 - **`models`** — one entry per idle context; `idle_contexts` is the number of pooled contexts ready to reuse.
 - **`batch_schedulers`** — empty.
 - **`pool_stats`** — `hit_rate` is the fraction of requests that reused a pooled context.
+
+### `GET /health` — Liveness check
+
+```bash
+curl http://localhost:11434/health
+```
+
+```json
+{
+  "status": "ok",
+  "uptime_seconds": 142,
+  "loaded_models": 1,
+  "inference_slots": {
+    "active": 0,
+    "available": 4,
+    "max": 4
+  },
+  "context_pool": {
+    "idle": 0,
+    "hit_rate": "0.0%"
+  },
+  "jvm": {
+    "heap_used_bytes": 134217728,
+    "heap_max_bytes": 4294967296,
+    "heap_used_mb": 128,
+    "heap_max_mb": 4096,
+    "threads": 24
+  }
+}
+```
+
+`status` is `"ok"` normally and `"busy"` when all inference slots are occupied (all `--max-concurrent` slots active). Use this endpoint as a liveness probe in Docker/Kubernetes.
+
+### `GET /metrics` — Prometheus metrics
+
+```bash
+curl http://localhost:11434/metrics
+```
+
+Returns Prometheus text format (`text/plain; version=0.0.4`). Metrics exposed:
+
+| Metric | Type | Description |
+|---|---|---|
+| `jllm_uptime_seconds` | gauge | Server uptime |
+| `jllm_tokens_generated_total` | counter | Total output tokens generated |
+| `jllm_rate_limit_rejected_total` | counter | Requests rejected by `--rate-limit` |
+| `jllm_body_too_large_total` | counter | Requests rejected by `--max-body` |
+| `jllm_inference_slots_active` | gauge | Slots currently in use |
+| `jllm_inference_slots_total` | gauge | Total slots (`--max-concurrent`) |
+| `jllm_context_pool_hits_total` | counter | KV cache reuse (ContextPool mode) |
+| `jllm_context_pool_misses_total` | counter | New context allocations |
+| `jllm_context_pool_evictions_total` | counter | Pool evictions |
+| `jllm_context_pool_idle` | gauge | Idle pooled contexts |
+| `jllm_models_loaded` | gauge | Model weights in memory |
+| `jllm_batch_active_sequences{model}` | gauge | BatchScheduler active sequences per model |
+| `jllm_batch_pending_requests{model}` | gauge | BatchScheduler queued requests per model |
+| `jllm_jvm_heap_used_bytes` | gauge | JVM heap used |
+| `jllm_jvm_heap_max_bytes` | gauge | JVM heap max (`-Xmx`) |
+| `jllm_jvm_threads` | gauge | JVM thread count |
+| `jllm_requests_total{endpoint,status}` | counter | HTTP requests by endpoint and status class (`2xx`/`4xx`/`5xx`) |
+| `jllm_request_duration_seconds{endpoint}` | histogram | Request latency per endpoint (buckets: 50ms, 100ms, 250ms, 500ms, 1s, 5s, 30s) |
+
+Example output:
+
+```
+# HELP jllm_uptime_seconds Server uptime in seconds
+# TYPE jllm_uptime_seconds gauge
+jllm_uptime_seconds 142
+# HELP jllm_tokens_generated_total Total output tokens generated across all requests
+# TYPE jllm_tokens_generated_total counter
+jllm_tokens_generated_total 4821
+# HELP jllm_requests_total HTTP requests total by endpoint and status class
+# TYPE jllm_requests_total counter
+jllm_requests_total{endpoint="api_generate",status="2xx"} 19
+jllm_requests_total{endpoint="api_chat",status="2xx"} 7
+# HELP jllm_request_duration_seconds HTTP request latency histogram
+# TYPE jllm_request_duration_seconds histogram
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="0.05"} 0
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="0.1"} 0
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="0.25"} 1
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="0.5"} 3
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="1"} 7
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="5"} 7
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="30"} 7
+jllm_request_duration_seconds_bucket{endpoint="api_chat",le="+Inf"} 7
+jllm_request_duration_seconds_sum{endpoint="api_chat"} 4.218291
+jllm_request_duration_seconds_count{endpoint="api_chat"} 7
+```
+
+Wire it to Prometheus with a static scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: jllm
+    static_configs:
+      - targets: ['localhost:11434']
+    metrics_path: /metrics
+```
 
 ### `POST /api/generate` — Generate text
 
