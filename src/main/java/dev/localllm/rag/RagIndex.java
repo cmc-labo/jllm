@@ -3,6 +3,7 @@ package dev.localllm.rag;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
@@ -11,8 +12,10 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
@@ -38,6 +41,8 @@ import java.util.List;
  *   <li>{@code source} — absolute path of the source file (StringField, stored, indexed)</li>
  *   <li>{@code page}   — 1-based page number; -1 for plain-text files (StoredField)</li>
  *   <li>{@code content} — chunk text (TextField, analyzed + stored, BM25-ranked)</li>
+ *   <li>{@code embedding} — optional {@link KnnFloatVectorField}, present only for hybrid
+ *       (BM25+vector) collections; see {@link HybridConfig}</li>
  * </ul>
  */
 public class RagIndex {
@@ -53,40 +58,71 @@ public class RagIndex {
      * Returns an empty list if the index does not exist or the query fails.
      */
     public List<RagResult> search(String queryText, int topK) throws Exception {
+        return search(queryText, topK, null);
+    }
+
+    /**
+     * Search for the {@code topK} most relevant chunks. When {@code queryEmbedding} is
+     * non-null, also runs a KNN vector search against the {@code embedding} field and
+     * fuses it with the BM25 ranking via {@link RankFusion} (Reciprocal Rank Fusion).
+     * When {@code queryEmbedding} is null, behavior is pure BM25, identical to
+     * {@link #search(String, int)}.
+     */
+    public List<RagResult> search(String queryText, int topK, float[] queryEmbedding) throws Exception {
         if (!indexExists()) return Collections.emptyList();
 
         try (FSDirectory dir = FSDirectory.open(indexPath);
              DirectoryReader reader = DirectoryReader.open(dir)) {
 
             IndexSearcher searcher = new IndexSearcher(reader);
-            StandardAnalyzer analyzer = new StandardAnalyzer();
-            QueryParser parser = new QueryParser("content", analyzer);
-            parser.setDefaultOperator(QueryParser.Operator.OR);
+            int fetchK = queryEmbedding != null ? Math.max(topK * 4, 20) : topK;
 
-            Query query;
-            try {
-                query = parser.parse(QueryParser.escape(queryText));
-            } catch (Exception e) {
-                return Collections.emptyList();
+            List<RagResult> bm25Results = bm25Search(searcher, queryText, fetchK);
+            if (queryEmbedding == null) {
+                // No fusion requested: trim straight down to topK and return as-is.
+                return bm25Results.size() > topK ? bm25Results.subList(0, topK) : bm25Results;
             }
 
-            TopDocs hits = searcher.search(query, topK);
-            List<RagResult> results = new ArrayList<>();
-            StoredFields sf = searcher.storedFields();
+            KnnFloatVectorQuery knnQuery = new KnnFloatVectorQuery("embedding", queryEmbedding, fetchK);
+            TopDocs knnHits = searcher.search(knnQuery, fetchK);
+            List<RagResult> vectorResults = toResults(searcher, knnHits);
 
-            for (ScoreDoc sd : hits.scoreDocs) {
-                Document doc = sf.document(sd.doc);
-                String source  = doc.get("source");
-                String content = doc.get("content");
-                int page = -1;
-                org.apache.lucene.index.IndexableField pageField = doc.getField("page");
-                if (pageField != null && pageField.numericValue() != null) {
-                    page = pageField.numericValue().intValue();
-                }
-                results.add(new RagResult(source, page, content, sd.score));
-            }
-            return results;
+            return RankFusion.fuse(bm25Results, vectorResults, topK);
         }
+    }
+
+    private List<RagResult> bm25Search(IndexSearcher searcher, String queryText, int fetchK) throws Exception {
+        StandardAnalyzer analyzer = new StandardAnalyzer();
+        QueryParser parser = new QueryParser("content", analyzer);
+        parser.setDefaultOperator(QueryParser.Operator.OR);
+
+        Query query;
+        try {
+            query = parser.parse(QueryParser.escape(queryText));
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+
+        TopDocs hits = searcher.search(query, fetchK);
+        return toResults(searcher, hits);
+    }
+
+    private List<RagResult> toResults(IndexSearcher searcher, TopDocs hits) throws Exception {
+        List<RagResult> results = new ArrayList<>();
+        StoredFields sf = searcher.storedFields();
+
+        for (ScoreDoc sd : hits.scoreDocs) {
+            Document doc = sf.document(sd.doc);
+            String source  = doc.get("source");
+            String content = doc.get("content");
+            int page = -1;
+            org.apache.lucene.index.IndexableField pageField = doc.getField("page");
+            if (pageField != null && pageField.numericValue() != null) {
+                page = pageField.numericValue().intValue();
+            }
+            results.add(new RagResult(source, page, content, sd.score));
+        }
+        return results;
     }
 
     /** Total number of indexed chunks (documents) in this collection. */
@@ -118,12 +154,23 @@ public class RagIndex {
         return new IndexWriter(FSDirectory.open(indexPath), config);
     }
 
-    /** Build a Lucene Document for one text chunk. */
+    /** Build a Lucene Document for one text chunk (BM25-only, no embedding). */
     static Document buildDocument(String absSource, int page, String chunkText) {
+        return buildDocument(absSource, page, chunkText, null);
+    }
+
+    /**
+     * Build a Lucene Document for one text chunk. When {@code embedding} is non-null, a
+     * {@link KnnFloatVectorField} is added so the chunk participates in vector search.
+     */
+    static Document buildDocument(String absSource, int page, String chunkText, float[] embedding) {
         Document doc = new Document();
         doc.add(new StringField("source", absSource, Field.Store.YES));
         doc.add(new StoredField("page", page));
         doc.add(new TextField("content", chunkText, Field.Store.YES));
+        if (embedding != null) {
+            doc.add(new KnnFloatVectorField("embedding", embedding, VectorSimilarityFunction.COSINE));
+        }
         return doc;
     }
 }

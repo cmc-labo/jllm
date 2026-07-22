@@ -368,7 +368,7 @@ Supported file types: **PDF** (text extracted page-by-page via PDFBox), plus any
 2. **Retrieve** — at the start of each chat turn (or each API request), jllm queries the index with the user's message and retrieves the top-5 most relevant chunks.
 3. **Generate** — the retrieved chunks are prepended to the model's system prompt as a `[Context from local documents]` block. The model uses them to answer and cites the source file (and page number for PDFs).
 
-No embedding model is needed — BM25 is fast, accurate for keyword-rich queries, and requires zero configuration.
+No embedding model is needed by default — BM25 is fast, accurate for keyword-rich queries, and requires zero configuration. For queries that are phrased differently from the source text (semantic similarity rather than shared keywords), you can opt into **hybrid search** — see below.
 
 ### `jllm rag add` — Index documents
 
@@ -386,6 +386,23 @@ jllm rag add legal-docs   ~/contracts/
 
 Re-indexing a file that was already indexed is safe — the old chunks are replaced automatically, so `rag add` is idempotent.
 
+### Hybrid search (optional) — BM25 + vector embeddings
+
+Pass `--embed-model <name>` to index a collection with vector embeddings alongside BM25, using any already-pulled local GGUF embedding model (e.g. `nomic-embed-text`, `mxbai-embed-large`) via the same llama.cpp engine jllm already uses for chat — no ONNX runtime or separate inference stack required.
+
+```bash
+jllm pull nomic-embed-text
+jllm rag add my-docs ~/documents/ --embed-model nomic-embed-text
+```
+
+At query time, jllm runs BM25 and vector (cosine similarity, via Lucene's built-in KNN vector search) independently and combines them with Reciprocal Rank Fusion — no score-scale calibration needed. This is entirely opt-in and per-collection:
+
+- Collections created without `--embed-model` are unaffected — same behavior, same cost, as before this feature existed.
+- Whether a collection is hybrid is recorded once, at index time, in `<collection>/hybrid.json`. `jllm rag search`/`jllm run --rag`/the API all detect this automatically — no extra flags needed at query time.
+- Re-running `rag add` on a hybrid collection without repeating `--embed-model` reuses the recorded model automatically.
+- Enabling hybrid on a collection that already has BM25-only documents triggers a full rebuild (so the collection never ends up with partial vector coverage). Switching to a *different* embedding model requires `jllm rag rm` + re-add.
+- Hybrid indexing/search requires the native JNI library (same requirement as `/api/embeddings`); if it's unavailable at query time, jllm logs a warning and falls back to BM25-only rather than failing the request.
+
 ### `jllm rag list` — List collections
 
 ```bash
@@ -397,8 +414,10 @@ COLLECTION                  CHUNKS  PATH
 ---------------------------------------------------------------------------
 api-specs                      248  /home/user/.local-llm/rag/api-specs
 legal-docs                      91  /home/user/.local-llm/rag/legal-docs
-my-docs                         57  /home/user/.local-llm/rag/my-docs
+my-docs                         57  /home/user/.local-llm/rag/my-docs  [hybrid: nomic-embed-text]
 ```
+
+(`[hybrid: <model>]` is only shown for collections indexed with `--embed-model`.)
 
 ### `jllm rag search` — Test retrieval
 
@@ -414,6 +433,13 @@ jllm rag search my-docs "transformer attention mechanism"
 
 [2] attention-is-all-you-need.pdf (page 4)  score=3.104
     Multi-Head Attention Instead of performing a single attention function with d_model-dimensional...
+```
+
+For a hybrid collection, `score` is the fused Reciprocal Rank Fusion score and the per-signal breakdown is shown alongside it:
+
+```
+[1] attention-is-all-you-need.pdf (page 3)  score=0.033  (bm25=4.821, vector=0.812)
+    Scaled Dot-Product Attention We call our particular attention "Scaled Dot-Product Attention"...
 ```
 
 ### `jllm rag rm` — Delete a collection

@@ -35,7 +35,7 @@ import java.util.stream.Collectors;
 public class Main {
 
     private static final ModelRegistry registry   = new ModelRegistry();
-    private static final RagManager    ragManager = new RagManager(ModelRegistry.getRagDir());
+    private static final RagManager    ragManager = new RagManager(ModelRegistry.getRagDir(), registry);
 
     // Loaded once at startup; shared across commands.
     private static final PluginManager plugins;
@@ -1115,17 +1115,27 @@ public class Main {
 
     private static void cmdRagAdd(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: jllm rag add <collection> <path>");
+            System.err.println("Usage: jllm rag add <collection> <path> [--embed-model <name>]");
             System.exit(1);
         }
         String collection = args[2];
         Path   path       = Paths.get(args[3]);
+        String embedModel = null;
+        for (int i = 4; i < args.length; i++) {
+            if ("--embed-model".equals(args[i]) && i + 1 < args.length) {
+                embedModel = args[++i];
+            } else {
+                System.err.println("Unknown flag: " + args[i]);
+                System.exit(1);
+            }
+        }
         if (!Files.exists(path)) {
             System.err.println("Path not found: " + path);
             System.exit(1);
         }
-        System.out.println("Indexing into collection '" + collection + "'...");
-        ragManager.addDocuments(collection, path, System.out::println);
+        System.out.println("Indexing into collection '" + collection + "'..."
+                + (embedModel != null ? "  (hybrid: " + embedModel + ")" : ""));
+        ragManager.addDocuments(collection, path, embedModel, System.out::println);
         System.out.println("Done.");
         System.out.println("Use: jllm run <model> --rag " + collection);
     }
@@ -1140,7 +1150,8 @@ public class Main {
         System.out.printf("%-25s  %8s  %s%n", "COLLECTION", "CHUNKS", "PATH");
         System.out.println("-".repeat(75));
         for (RagManager.CollectionInfo c : collections) {
-            System.out.printf("%-25s  %8d  %s%n", c.name, c.chunkCount, c.path);
+            String suffix = c.embedModel != null ? "  [hybrid: " + c.embedModel + "]" : "";
+            System.out.printf("%-25s  %8d  %s%s%n", c.name, c.chunkCount, c.path, suffix);
         }
     }
 
@@ -1163,7 +1174,13 @@ public class Main {
             String fileName = Paths.get(r.source).getFileName().toString();
             System.out.printf("[%d] %s", i + 1, fileName);
             if (r.page > 0) System.out.printf(" (page %d)", r.page);
-            System.out.printf("  score=%.3f%n", r.score);
+            System.out.printf("  score=%.3f", r.score);
+            if (!Float.isNaN(r.bm25Score) || !Float.isNaN(r.vectorScore)) {
+                System.out.printf("  (bm25=%s, vector=%s)",
+                        Float.isNaN(r.bm25Score)   ? "-" : String.format("%.3f", r.bm25Score),
+                        Float.isNaN(r.vectorScore) ? "-" : String.format("%.3f", r.vectorScore));
+            }
+            System.out.println();
             System.out.println("    " + r.content.replaceAll("\\s+", " ")
                     .substring(0, Math.min(200, r.content.length())) + "...");
             System.out.println();
@@ -1184,7 +1201,12 @@ public class Main {
         System.out.println("Usage: jllm rag <subcommand> [options]");
         System.out.println();
         System.out.println("Subcommands:");
-        System.out.println("  add <collection> <path>      Index a file or directory into a collection");
+        System.out.println("  add <collection> <path> [--embed-model <name>]");
+        System.out.println("                                Index a file or directory into a collection.");
+        System.out.println("                                --embed-model enables hybrid BM25+vector search");
+        System.out.println("                                using the named (already-pulled) GGUF embedding");
+        System.out.println("                                model, e.g. nomic-embed-text. Omit for BM25-only");
+        System.out.println("                                (default, zero configuration).");
         System.out.println("  list                         List all indexed collections");
         System.out.println("  search <collection> <query>  Test retrieval (debug)");
         System.out.println("  rm <collection>              Delete a collection and its index");
@@ -1593,7 +1615,8 @@ public class Main {
         System.out.println("        [--max-body <bytes>]              Max request body size, e.g. 4M (default: 4M)");
         System.out.println("        [--max-tokens <n>]               Server-side output token cap, 0=off (default: 0)");
         System.out.println("        [--rate-limit <req/min>]          Per-IP rate limit, 0=off (default: 0)");
-        System.out.println("  rag add <collection> <path>             Index a file or directory for RAG");
+        System.out.println("  rag add <collection> <path> [--embed-model <name>]");
+        System.out.println("                                           Index a file or directory for RAG");
         System.out.println("  rag list                                List RAG collections");
         System.out.println("  rag search <collection> <query>         Test RAG retrieval");
         System.out.println("  rag rm <collection>                     Delete a RAG collection");
