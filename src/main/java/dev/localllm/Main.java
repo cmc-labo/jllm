@@ -1115,29 +1115,52 @@ public class Main {
 
     private static void cmdRagAdd(String[] args) throws Exception {
         if (args.length < 4) {
-            System.err.println("Usage: jllm rag add <collection> <path> [--embed-model <name>]");
+            System.err.println("Usage: jllm rag add <collection> <path> [--embed-model <name>]"
+                    + " [--chunk-size <words>] [--chunk-overlap <words>]");
             System.exit(1);
         }
         String collection = args[2];
         Path   path       = Paths.get(args[3]);
-        String embedModel = null;
+        RagManager.IndexOptions options = new RagManager.IndexOptions();
         for (int i = 4; i < args.length; i++) {
-            if ("--embed-model".equals(args[i]) && i + 1 < args.length) {
-                embedModel = args[++i];
-            } else {
-                System.err.println("Unknown flag: " + args[i]);
-                System.exit(1);
+            switch (args[i]) {
+                case "--embed-model":
+                    if (i + 1 < args.length) options.embedModel = args[++i];
+                    break;
+                case "--chunk-size":
+                    if (i + 1 < args.length) options.chunkWords = parseIntFlag(args[i], args[++i]);
+                    break;
+                case "--chunk-overlap":
+                    if (i + 1 < args.length) options.overlapWords = parseIntFlag(args[i], args[++i]);
+                    break;
+                default:
+                    System.err.println("Unknown flag: " + args[i]);
+                    System.exit(1);
             }
         }
         if (!Files.exists(path)) {
             System.err.println("Path not found: " + path);
             System.exit(1);
         }
-        System.out.println("Indexing into collection '" + collection + "'..."
-                + (embedModel != null ? "  (hybrid: " + embedModel + ")" : ""));
-        ragManager.addDocuments(collection, path, embedModel, System.out::println);
+        String suffix = (options.embedModel != null ? "  (hybrid: " + options.embedModel + ")" : "")
+                + (options.chunkWords != null || options.overlapWords != null
+                        ? "  (chunk: " + (options.chunkWords != null ? options.chunkWords : "default")
+                          + "/" + (options.overlapWords != null ? options.overlapWords : "default") + ")"
+                        : "");
+        System.out.println("Indexing into collection '" + collection + "'..." + suffix);
+        ragManager.addDocuments(collection, path, options, System.out::println);
         System.out.println("Done.");
         System.out.println("Use: jllm run <model> --rag " + collection);
+    }
+
+    private static int parseIntFlag(String flagName, String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            System.err.println("Invalid value for " + flagName + ": '" + value + "' is not an integer");
+            System.exit(1);
+            throw new AssertionError("unreachable");
+        }
     }
 
     private static void cmdRagList() throws Exception {
@@ -1151,6 +1174,9 @@ public class Main {
         System.out.println("-".repeat(75));
         for (RagManager.CollectionInfo c : collections) {
             String suffix = c.embedModel != null ? "  [hybrid: " + c.embedModel + "]" : "";
+            if (c.chunkWords > 0) {
+                suffix += "  [chunk:" + c.chunkWords + "/" + c.overlapWords + "]";
+            }
             System.out.printf("%-25s  %8d  %s%s%n", c.name, c.chunkCount, c.path, suffix);
         }
     }
@@ -1202,11 +1228,16 @@ public class Main {
         System.out.println();
         System.out.println("Subcommands:");
         System.out.println("  add <collection> <path> [--embed-model <name>]");
+        System.out.println("                           [--chunk-size <words>] [--chunk-overlap <words>]");
         System.out.println("                                Index a file or directory into a collection.");
         System.out.println("                                --embed-model enables hybrid BM25+vector search");
         System.out.println("                                using the named (already-pulled) GGUF embedding");
         System.out.println("                                model, e.g. nomic-embed-text. Omit for BM25-only");
         System.out.println("                                (default, zero configuration).");
+        System.out.println("                                --chunk-size/--chunk-overlap set the chunking");
+        System.out.println("                                window in words (default 400/50). Recorded per");
+        System.out.println("                                collection and reused on later 'rag add' unless");
+        System.out.println("                                overridden.");
         System.out.println("  list                         List all indexed collections");
         System.out.println("  search <collection> <query>  Test retrieval (debug)");
         System.out.println("  rm <collection>              Delete a collection and its index");
@@ -1616,6 +1647,7 @@ public class Main {
         System.out.println("        [--max-tokens <n>]               Server-side output token cap, 0=off (default: 0)");
         System.out.println("        [--rate-limit <req/min>]          Per-IP rate limit, 0=off (default: 0)");
         System.out.println("  rag add <collection> <path> [--embed-model <name>]");
+        System.out.println("           [--chunk-size <words>] [--chunk-overlap <words>]");
         System.out.println("                                           Index a file or directory for RAG");
         System.out.println("  rag list                                List RAG collections");
         System.out.println("  rag search <collection> <query>         Test RAG retrieval");

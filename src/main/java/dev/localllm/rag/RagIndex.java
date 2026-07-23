@@ -42,7 +42,7 @@ import java.util.List;
  *   <li>{@code page}   — 1-based page number; -1 for plain-text files (StoredField)</li>
  *   <li>{@code content} — chunk text (TextField, analyzed + stored, BM25-ranked)</li>
  *   <li>{@code embedding} — optional {@link KnnFloatVectorField}, present only for hybrid
- *       (BM25+vector) collections; see {@link HybridConfig}</li>
+ *       (BM25+vector) collections; see {@link CollectionConfig}</li>
  * </ul>
  */
 public class RagIndex {

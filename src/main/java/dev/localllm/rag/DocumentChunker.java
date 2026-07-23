@@ -15,8 +15,8 @@ import java.util.List;
  */
 public class DocumentChunker {
 
-    static final int CHUNK_WORDS   = 400;
-    static final int OVERLAP_WORDS = 50;
+    public static final int CHUNK_WORDS   = 400;
+    public static final int OVERLAP_WORDS = 50;
 
     public static List<String> chunk(String text) {
         return chunk(text, CHUNK_WORDS, OVERLAP_WORDS);

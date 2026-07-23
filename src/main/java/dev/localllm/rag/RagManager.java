@@ -29,10 +29,11 @@ import java.util.stream.Stream;
  * BM25 full-text search by {@link RagIndex}.
  *
  * <p>A collection can optionally be made <b>hybrid</b> (BM25 + vector search) by
- * indexing it with an embedding model: {@code jllm rag add <collection> <path>
- * --embed-model <name>}. This is opt-in per collection — collections indexed without
- * {@code --embed-model} behave exactly as before (pure BM25, no embedding model loaded,
- * zero extra cost). Whether a collection is hybrid is recorded in {@link HybridConfig}
+ * indexing it with an embedding model, and/or given a custom chunk size/overlap:
+ * {@code jllm rag add <collection> <path> [--embed-model <name>] [--chunk-size <words>]
+ * [--chunk-overlap <words>]}. Both are opt-in per collection — collections indexed
+ * without these flags behave exactly as before (pure BM25, default 400/50-word
+ * chunking, zero extra cost). Customization is recorded in {@link CollectionConfig}
  * and read back automatically on subsequent {@code add}/{@code search} calls.
  *
  * <p>Usage flow:
@@ -71,10 +72,24 @@ public class RagManager {
         this.registry = registry;
     }
 
+    /**
+     * Optional per-call indexing customization for {@link #addDocuments(String, Path,
+     * IndexOptions, Consumer)}. All fields are {@code null}/unset by default, meaning
+     * "use whatever this collection was previously indexed with, or the defaults."
+     */
+    public static class IndexOptions {
+        /** Registry name of the embedding model to use, or {@code null} for BM25-only. */
+        public String embedModel;
+        /** Chunk size in words, or {@code null} to reuse the recorded/default value. */
+        public Integer chunkWords;
+        /** Chunk overlap in words, or {@code null} to reuse the recorded/default value. */
+        public Integer overlapWords;
+    }
+
     // ── Indexing ──────────────────────────────────────────────────────────────
 
     /**
-     * Index a file or directory into the named collection (BM25-only).
+     * Index a file or directory into the named collection (BM25-only, default chunk size).
      * Re-indexing an already-indexed file replaces its previous chunks.
      * Unsupported or unreadable files are skipped with a warning.
      *
@@ -84,35 +99,44 @@ public class RagManager {
      */
     public void addDocuments(String collection, Path path, Consumer<String> progress)
             throws Exception {
-        addDocuments(collection, path, null, progress);
+        addDocuments(collection, path, new IndexOptions(), progress);
     }
 
     /**
      * Index a file or directory into the named collection, optionally computing and
-     * storing vector embeddings alongside the BM25 index.
+     * storing vector embeddings alongside the BM25 index and/or using a custom chunk
+     * size/overlap.
      *
-     * <p>If {@code embedModel} is non-null and the collection has no prior
-     * {@link HybridConfig} (i.e. this is the first time hybrid mode is enabled), any
-     * existing documents are dropped and the collection is rebuilt from scratch — this
-     * avoids ever leaving a collection with partial vector coverage. If the collection
-     * is already hybrid, {@code embedModel} may be omitted (the recorded model is reused)
-     * or must match the recorded model exactly.
+     * <p>If {@code options.embedModel} is non-null and the collection has no prior
+     * {@link CollectionConfig} recording an embed model (i.e. this is the first time
+     * hybrid mode is enabled), any existing documents are dropped and the collection is
+     * rebuilt from scratch — this avoids ever leaving a collection with partial vector
+     * coverage. If the collection is already hybrid, {@code options.embedModel} may be
+     * omitted (the recorded model is reused) or must match the recorded model exactly.
+     *
+     * <p>{@code options.chunkWords}/{@code options.overlapWords} follow a more lenient
+     * rule: if omitted, the recorded values (or the {@link DocumentChunker} defaults) are
+     * reused; if given and different from what's recorded, the collection is <em>not</em>
+     * rebuilt (chunk length isn't a structural index constraint the way vector dimension
+     * is) — only files indexed in this run use the new size, and a note is printed via
+     * {@code progress} so the resulting mixed granularity isn't a silent surprise.
      *
      * @param collection collection name (created automatically if it doesn't exist)
      * @param path       file or directory to index
-     * @param embedModel registry name of the embedding model to use, or {@code null} for BM25-only
+     * @param options    embedding/chunking customization (never {@code null})
      * @param progress   optional callback that receives one status line per file
      */
-    public void addDocuments(String collection, Path path, String embedModel, Consumer<String> progress)
+    public void addDocuments(String collection, Path path, IndexOptions options, Consumer<String> progress)
             throws Exception {
         Files.createDirectories(ragDir);
         Path indexPath = ragDir.resolve(collection);
 
-        HybridConfig existing = HybridConfig.load(indexPath);
+        CollectionConfig existing = CollectionConfig.load(indexPath);
         LlamaModel embedder = null;
-        HybridConfig effectiveConfig = existing;
 
-        if (embedModel != null && existing != null && !embedModel.equals(existing.embedModel)) {
+        String embedModel = options.embedModel;
+        if (embedModel != null && existing != null && existing.embedModel != null
+                && !embedModel.equals(existing.embedModel)) {
             throw new IllegalArgumentException(
                 "Collection '" + collection + "' was built with embedding model '" + existing.embedModel
                 + "', not '" + embedModel + "'. Run 'jllm rag rm " + collection
@@ -120,6 +144,29 @@ public class RagManager {
         }
 
         String resolvedEmbedModel = embedModel != null ? embedModel : (existing != null ? existing.embedModel : null);
+        int dimensions = existing != null ? existing.dimensions : 0;
+
+        int chunkWords = options.chunkWords != null ? options.chunkWords
+                : (existing != null && existing.chunkWords > 0 ? existing.chunkWords : DocumentChunker.CHUNK_WORDS);
+        int overlapWords = options.overlapWords != null ? options.overlapWords
+                : (existing != null && existing.overlapWords > 0 ? existing.overlapWords : DocumentChunker.OVERLAP_WORDS);
+
+        if (chunkWords <= 0 || overlapWords < 0 || overlapWords >= chunkWords) {
+            throw new IllegalArgumentException(
+                "Invalid chunk size/overlap: chunk-size must be positive and greater than "
+                + "chunk-overlap (got chunk-size=" + chunkWords + ", chunk-overlap=" + overlapWords + ")");
+        }
+
+        if (existing != null && (existing.chunkWords > 0 && existing.chunkWords != chunkWords
+                || existing.overlapWords > 0 && existing.overlapWords != overlapWords)) {
+            int prevChunk   = existing.chunkWords   > 0 ? existing.chunkWords   : DocumentChunker.CHUNK_WORDS;
+            int prevOverlap = existing.overlapWords > 0 ? existing.overlapWords : DocumentChunker.OVERLAP_WORDS;
+            if (progress != null) {
+                progress.accept(String.format(
+                    "Note: chunk size changed (%d/%d -> %d/%d) — only files indexed in this run use the new size.",
+                    prevChunk, prevOverlap, chunkWords, overlapWords));
+            }
+        }
 
         if (resolvedEmbedModel != null) {
             if (!LlamaModel.isNativeLibraryAvailable()) {
@@ -128,7 +175,7 @@ public class RagManager {
             }
             embedder = loadEmbedModel(resolvedEmbedModel);
 
-            boolean firstTimeHybrid = existing == null;
+            boolean firstTimeHybrid = existing == null || existing.embedModel == null;
             if (firstTimeHybrid && Files.exists(indexPath) && new RagIndex(indexPath).docCount() > 0) {
                 // Enabling hybrid on a collection that already has BM25-only documents:
                 // rebuild fully rather than risk partial vector coverage.
@@ -137,7 +184,7 @@ public class RagManager {
             }
             if (firstTimeHybrid) {
                 float[] probe = embedder.embed("probe", EMBED_N_CTX, EMBED_N_THREADS);
-                effectiveConfig = new HybridConfig(resolvedEmbedModel, probe.length);
+                dimensions = probe.length;
             }
         }
 
@@ -166,17 +213,22 @@ public class RagManager {
         LlamaModel embedderForBatch = embedder;
         try (IndexWriter writer = RagIndex.openWriter(indexPath)) {
             for (Path file : files) {
-                indexFile(writer, file, embedderForBatch, progress);
+                indexFile(writer, file, embedderForBatch, chunkWords, overlapWords, progress);
             }
             writer.commit();
         }
 
-        if (resolvedEmbedModel != null && effectiveConfig != null) {
-            effectiveConfig.save(indexPath);
+        boolean customized = resolvedEmbedModel != null
+                || chunkWords != DocumentChunker.CHUNK_WORDS
+                || overlapWords != DocumentChunker.OVERLAP_WORDS
+                || existing != null;
+        if (customized) {
+            new CollectionConfig(resolvedEmbedModel, dimensions, chunkWords, overlapWords).save(indexPath);
         }
     }
 
-    private void indexFile(IndexWriter writer, Path path, LlamaModel embedder, Consumer<String> progress) {
+    private void indexFile(IndexWriter writer, Path path, LlamaModel embedder,
+                            int chunkWords, int overlapWords, Consumer<String> progress) {
         String absPath = path.toAbsolutePath().toString();
         try {
             // Delete previous chunks for this source so re-indexing is idempotent.
@@ -185,7 +237,7 @@ public class RagManager {
             List<DocumentReader.PageContent> pages = DocumentReader.readPages(path);
             int totalChunks = 0;
             for (DocumentReader.PageContent page : pages) {
-                List<String> chunks = DocumentChunker.chunk(page.text);
+                List<String> chunks = DocumentChunker.chunk(page.text, chunkWords, overlapWords);
                 for (String chunk : chunks) {
                     float[] embedding = null;
                     if (embedder != null) {
@@ -241,8 +293,8 @@ public class RagManager {
         Path indexPath = ragDir.resolve(collection);
         RagIndex index = new RagIndex(indexPath);
 
-        HybridConfig hybrid = HybridConfig.load(indexPath);
-        if (hybrid == null) {
+        CollectionConfig config = CollectionConfig.load(indexPath);
+        if (config == null || config.embedModel == null) {
             return index.search(query, topK);
         }
 
@@ -255,7 +307,7 @@ public class RagManager {
         }
 
         try {
-            LlamaModel embedder = loadEmbedModel(hybrid.embedModel);
+            LlamaModel embedder = loadEmbedModel(config.embedModel);
             float[] queryEmbedding = embedder.embed(query, EMBED_N_CTX, EMBED_N_THREADS);
             return index.search(query, topK, queryEmbedding);
         } catch (Exception e) {
@@ -276,9 +328,12 @@ public class RagManager {
                                   .collect(Collectors.toList())) {
                 try {
                     int count = new RagIndex(dir).docCount();
-                    HybridConfig hybrid = HybridConfig.load(dir);
-                    String embedModel = hybrid != null ? hybrid.embedModel : null;
-                    result.add(new CollectionInfo(dir.getFileName().toString(), dir, count, embedModel));
+                    CollectionConfig config = CollectionConfig.load(dir);
+                    String embedModel   = config != null ? config.embedModel   : null;
+                    int    chunkWords   = config != null ? config.chunkWords   : 0;
+                    int    overlapWords = config != null ? config.overlapWords : 0;
+                    result.add(new CollectionInfo(dir.getFileName().toString(), dir, count,
+                            embedModel, chunkWords, overlapWords));
                 } catch (Exception e) {
                     LOG.debug("Skipping invalid index dir: {}", dir);
                 }
@@ -336,11 +391,18 @@ public class RagManager {
         /** Registry name of the embedding model, or {@code null} for BM25-only collections. */
         public final String embedModel;
 
-        CollectionInfo(String name, Path path, int chunkCount, String embedModel) {
-            this.name       = name;
-            this.path       = path;
-            this.chunkCount = chunkCount;
-            this.embedModel = embedModel;
+        /** Custom chunk size/overlap in words, or {@code 0} if this collection uses the defaults. */
+        public final int chunkWords;
+        public final int overlapWords;
+
+        CollectionInfo(String name, Path path, int chunkCount, String embedModel,
+                        int chunkWords, int overlapWords) {
+            this.name         = name;
+            this.path         = path;
+            this.chunkCount   = chunkCount;
+            this.embedModel   = embedModel;
+            this.chunkWords   = chunkWords;
+            this.overlapWords = overlapWords;
         }
     }
 }

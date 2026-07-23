@@ -364,7 +364,7 @@ Supported file types: **PDF** (text extracted page-by-page via PDFBox), plus any
 
 ### How it works
 
-1. **Index** — jllm reads each file, splits it into ~400-word chunks with 50-word overlap, and stores them in a [Lucene](https://lucene.apache.org/) BM25 full-text index at `~/.local-llm/rag/<collection>/`.
+1. **Index** — jllm reads each file, splits it into ~400-word chunks with 50-word overlap by default (customizable per collection, see below), and stores them in a [Lucene](https://lucene.apache.org/) BM25 full-text index at `~/.local-llm/rag/<collection>/`.
 2. **Retrieve** — at the start of each chat turn (or each API request), jllm queries the index with the user's message and retrieves the top-5 most relevant chunks.
 3. **Generate** — the retrieved chunks are prepended to the model's system prompt as a `[Context from local documents]` block. The model uses them to answer and cites the source file (and page number for PDFs).
 
@@ -398,10 +398,21 @@ jllm rag add my-docs ~/documents/ --embed-model nomic-embed-text
 At query time, jllm runs BM25 and vector (cosine similarity, via Lucene's built-in KNN vector search) independently and combines them with Reciprocal Rank Fusion — no score-scale calibration needed. This is entirely opt-in and per-collection:
 
 - Collections created without `--embed-model` are unaffected — same behavior, same cost, as before this feature existed.
-- Whether a collection is hybrid is recorded once, at index time, in `<collection>/hybrid.json`. `jllm rag search`/`jllm run --rag`/the API all detect this automatically — no extra flags needed at query time.
+- Whether a collection is hybrid is recorded once, at index time, in `<collection>/config.json`. `jllm rag search`/`jllm run --rag`/the API all detect this automatically — no extra flags needed at query time.
 - Re-running `rag add` on a hybrid collection without repeating `--embed-model` reuses the recorded model automatically.
 - Enabling hybrid on a collection that already has BM25-only documents triggers a full rebuild (so the collection never ends up with partial vector coverage). Switching to a *different* embedding model requires `jllm rag rm` + re-add.
 - Hybrid indexing/search requires the native JNI library (same requirement as `/api/embeddings`); if it's unavailable at query time, jllm logs a warning and falls back to BM25-only rather than failing the request.
+
+### Custom chunk size (optional)
+
+Pass `--chunk-size <words>` and/or `--chunk-overlap <words>` to `rag add` to override the default 400-word chunks / 50-word overlap for a collection — smaller chunks give more precise retrieval, larger chunks give the model more surrounding context per hit.
+
+```bash
+jllm rag add my-docs ~/documents/ --chunk-size 200 --chunk-overlap 20
+```
+
+- Also recorded in `<collection>/config.json` (alongside `--embed-model`, if used) and reused automatically on later `rag add` calls that omit the flags.
+- Unlike changing the embedding model, changing chunk size does **not** require a rebuild — chunk length isn't a structural index constraint. Only files (re-)indexed after the change use the new size; `rag add` prints a note when this creates mixed chunk granularity within a collection. Run `rag add <collection> <path>` over the full source directory again (or `rag rm` + re-add) to make an entire collection consistent.
 
 ### `jllm rag list` — List collections
 
@@ -414,10 +425,10 @@ COLLECTION                  CHUNKS  PATH
 ---------------------------------------------------------------------------
 api-specs                      248  /home/user/.local-llm/rag/api-specs
 legal-docs                      91  /home/user/.local-llm/rag/legal-docs
-my-docs                         57  /home/user/.local-llm/rag/my-docs  [hybrid: nomic-embed-text]
+my-docs                         57  /home/user/.local-llm/rag/my-docs  [hybrid: nomic-embed-text]  [chunk:200/20]
 ```
 
-(`[hybrid: <model>]` is only shown for collections indexed with `--embed-model`.)
+(`[hybrid: <model>]` and `[chunk:<size>/<overlap>]` are only shown when a collection was indexed with `--embed-model` and/or a custom `--chunk-size`/`--chunk-overlap`, respectively.)
 
 ### `jllm rag search` — Test retrieval
 
