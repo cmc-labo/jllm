@@ -17,19 +17,33 @@ import java.util.Set;
  * <ul>
  *   <li><b>PDF</b> ({@code .pdf}) — text is extracted per page via Apache PDFBox.
  *       Scanned/image-only PDFs produce no text and are silently skipped.</li>
- *   <li><b>Plain text</b> — any extension listed in {@link #TEXT_EXTENSIONS} is read
- *       as UTF-8 and returned as a single page.  Unknown extensions are also accepted
- *       as plain text to allow indexing of arbitrary source files.</li>
+ *   <li><b>Plain text</b> — any extension listed in {@link #TEXT_EXTENSIONS}, or any
+ *       filename listed in {@link #TEXT_FILENAMES} (for common extensionless files
+ *       like {@code Dockerfile}), is read as UTF-8 and returned as a single page.</li>
  * </ul>
  */
 public class DocumentReader {
 
     static final Set<String> TEXT_EXTENSIONS = Set.of(
-        ".txt", ".md", ".markdown", ".rst", ".adoc",
-        ".java", ".py", ".js", ".ts", ".go", ".rb", ".php", ".swift", ".kt",
-        ".c", ".cpp", ".h", ".hpp", ".cs", ".scala", ".rs",
-        ".html", ".htm", ".xml", ".json", ".yaml", ".yml",
-        ".csv", ".tsv", ".log", ".properties", ".sh", ".bat", ".sql"
+        // Docs / prose
+        ".txt", ".md", ".markdown", ".rst", ".adoc", ".tex",
+        // Programming languages
+        ".java", ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rb", ".php", ".swift", ".kt", ".kts",
+        ".c", ".cpp", ".h", ".hpp", ".cs", ".scala", ".rs", ".lua", ".pl", ".r", ".dart",
+        ".ex", ".exs", ".clj", ".hs", ".elm", ".vue", ".svelte", ".m", ".mm", ".groovy",
+        // Web / styling
+        ".html", ".htm", ".xml", ".css", ".scss", ".less",
+        // Data / config
+        ".json", ".ndjson", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+        ".csv", ".tsv", ".log", ".properties",
+        // Build / infra / schema
+        ".sh", ".bat", ".ps1", ".sql", ".gradle", ".proto", ".graphql", ".gql", ".tf", ".tfvars"
+    );
+
+    /** Filenames (compared case-insensitively, no extension) recognized as plain text. */
+    static final Set<String> TEXT_FILENAMES = Set.of(
+        "dockerfile", "makefile", "jenkinsfile", "rakefile", "gemfile",
+        ".gitignore", ".dockerignore"
     );
 
     public static class PageContent {
@@ -51,6 +65,7 @@ public class DocumentReader {
         if (!Files.isRegularFile(path)) return false;
         String name = path.getFileName().toString().toLowerCase();
         if (name.endsWith(".pdf")) return true;
+        if (TEXT_FILENAMES.contains(name)) return true;
         for (String ext : TEXT_EXTENSIONS) {
             if (name.endsWith(ext)) return true;
         }

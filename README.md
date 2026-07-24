@@ -360,7 +360,7 @@ Useful for bug reports and verifying the active JNI library status.
 RAG lets the model answer questions about your own files without sending anything outside the machine.  
 Documents are indexed once into a named **collection**; at chat time jllm retrieves the most relevant passages and injects them into the model's context automatically.
 
-Supported file types: **PDF** (text extracted page-by-page via PDFBox), plus any plain-text format (`.txt`, `.md`, `.java`, `.py`, `.json`, `.yaml`, `.html`, `.csv`, `.sql`, …).
+Supported file types: **PDF** (text extracted page-by-page via PDFBox), plus a wide range of plain-text formats — docs (`.txt`, `.md`, `.rst`, `.tex`), most programming languages (`.java`, `.py`, `.js/.ts/.jsx/.tsx`, `.go`, `.rs`, `.vue`, …), config/data (`.json`, `.yaml`, `.toml`, `.ini`, `.env`, `.csv`, …), and common extensionless files (`Dockerfile`, `Makefile`, `.gitignore`, …). See `DocumentReader.TEXT_EXTENSIONS`/`TEXT_FILENAMES` for the full list.
 
 ### How it works
 
