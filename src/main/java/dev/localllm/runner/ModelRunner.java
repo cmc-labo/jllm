@@ -216,6 +216,15 @@ public class ModelRunner {
                         printHelp(plugins);
                         continue;
                     }
+                    if ("/reload-plugins".equals(input)) {
+                        plugins.load();
+                        effectiveSystem = plugins.hasTools()
+                                ? buildSystemWithTools(baseSystem, plugins.getTools())
+                                : baseSystem;
+                        System.out.printf("[Plugins reloaded: %d tool(s), %d interceptor(s)]%n",
+                                plugins.getTools().size(), plugins.getInterceptors().size());
+                        continue;
+                    }
                     if (input.startsWith("/save")) {
                         String arg = input.length() > 5 ? input.substring(5).trim() : "";
                         saveConversation(history, model.getName(), baseSystem, arg);
@@ -468,7 +477,7 @@ public class ModelRunner {
             System.out.println("System   : " + preview);
         }
         System.out.printf("Settings : temperature=%.2f  max_tokens=%d  context=%d%n", temp, numPredict, nCtx);
-        System.out.println("Commands : /clear  /save [file]  /help  /quit");
+        System.out.println("Commands : /clear  /save [file]  /reload-plugins  /help  /quit");
         System.out.println("-".repeat(60));
     }
 
@@ -477,6 +486,7 @@ public class ModelRunner {
         System.out.println("  /clear         Clear conversation history and start fresh");
         System.out.println("  /save [file]   Save conversation log to a Markdown file");
         System.out.println("                   (defaults to jllm-chat-YYYYMMDD-HHmmss.md)");
+        System.out.println("  /reload-plugins  Rescan the plugin directory and reload tools/interceptors");
         System.out.println("  /help          Show this message");
         System.out.println("  /quit          Exit the chat  (also: /exit, /bye, Ctrl+D)");
         if (pm.hasTools()) {

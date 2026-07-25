@@ -65,7 +65,7 @@ public class Main {
             case "show":    cmdShow(args);      break;
             case "info":    cmdInfo(args);      break;
             case "storage": cmdStorage();       break;
-            case "plugins": cmdPlugins();       break;
+            case "plugins": cmdPlugins(args);   break;
             case "update":  cmdUpdate(args);    break;
             case "verify":  cmdVerify(args);    break;
             case "version": cmdVersion();       break;
@@ -700,9 +700,22 @@ public class Main {
         System.out.println("  missing   registered path no longer exists on disk");
     }
 
-    /** Show all currently loaded plugins (tools and interceptors). */
-    private static void cmdPlugins() {
+    /** Show all currently loaded plugins (tools and interceptors), or reload them with 'reload'. */
+    private static void cmdPlugins(String[] args) {
         Path pluginDir = ModelRegistry.getPluginsDir();
+
+        if (args.length > 1 && "reload".equals(args[1])) {
+            plugins.load();
+            System.out.printf("Reloaded plugin directory: %d tool(s), %d interceptor(s)%n%n",
+                    plugins.getTools().size(), plugins.getInterceptors().size());
+            System.out.println("Note: this only reloads plugins for this CLI process.");
+            System.out.println("A running 'jllm serve' watches the plugin directory itself and");
+            System.out.println("auto-reloads on change, or can be told to reload via:");
+            System.out.println("  curl -X POST http://localhost:<port>/api/plugins/reload");
+            System.out.println("An interactive 'jllm run' session can be reloaded with /reload-plugins.");
+            System.out.println();
+        }
+
         System.out.println("Plugin directory: " + pluginDir);
         System.out.println();
 
@@ -1663,6 +1676,8 @@ public class Main {
         System.out.println("       [--threads <int>]                  CPU threads for quantization (default: all)");
         System.out.println("  verify [<name>]                         Verify SHA-256 checksum(s): OK / MISMATCH / MISSING / NO HASH");
         System.out.println("  plugins                                 List loaded plugin tools and interceptors");
+        System.out.println("  plugins reload                          Rescan the plugin directory (see 'jllm run' /reload-plugins");
+        System.out.println("                                          and 'jllm serve' /api/plugins/reload for live processes)");
         System.out.println("  version                                 Show jllm version, runtime, and dependency info");
         System.out.println();
         System.out.println("Modelfile example (Ollama-compatible):");

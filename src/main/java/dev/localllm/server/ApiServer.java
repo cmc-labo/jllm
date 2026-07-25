@@ -14,7 +14,9 @@ import dev.localllm.model.Modelfile;
 import dev.localllm.model.ModelRegistry;
 import dev.localllm.model.SplitGguf;
 import dev.localllm.pull.HuggingFaceClient;
+import dev.localllm.plugin.LlmTool;
 import dev.localllm.plugin.PluginManager;
+import dev.localllm.plugin.PromptInterceptor;
 import dev.localllm.rag.RagManager;
 import dev.localllm.rag.RagResult;
 import io.undertow.Handlers;
@@ -27,6 +29,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.management.ManagementFactory;
@@ -36,6 +39,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.stream.Collectors;
@@ -241,6 +247,9 @@ public class ApiServer {
             .post("/api/delete",          b(this::handleApiDelete))
             .delete("/api/delete",        b(this::handleApiDelete))
             .post("/api/add",             b(this::handleApiAdd))
+            // ── Plugin management ─────────────────────────────────────────────
+            .get("/api/plugins",          b(this::handlePlugins))
+            .post("/api/plugins/reload",  b(this::handlePluginsReload))
             // ── OpenAI API ───────────────────────────────────────────────────
             .get("/v1/models",            b(this::handleV1Models))
             .post("/v1/chat/completions", b(this::handleV1ChatCompletions))
@@ -252,6 +261,7 @@ public class ApiServer {
             .setHandler(withCors(router))
             .build();
         server.start();
+        startPluginWatcher();
 
         System.out.printf("Listening on http://localhost:%d%n", port);
         System.out.println();
@@ -286,6 +296,15 @@ public class ApiServer {
         System.out.printf("  POST /api/copy              http://localhost:%d/api/copy%n", port);
         System.out.printf("  POST /api/delete            http://localhost:%d/api/delete%n", port);
         System.out.printf("  POST /api/add               http://localhost:%d/api/add%n", port);
+        System.out.println();
+        System.out.println("Plugins:");
+        System.out.printf("  GET  /api/plugins           http://localhost:%d/api/plugins%n", port);
+        System.out.printf("  POST /api/plugins/reload    http://localhost:%d/api/plugins/reload%n", port);
+        System.out.printf("  %d tool(s), %d interceptor(s) loaded from %s%n",
+            plugins.getTools().size(), plugins.getInterceptors().size(),
+            plugins.getPluginDir() != null ? plugins.getPluginDir() : "(none)");
+        System.out.printf("  Directory watch: %s (auto-reloads on plugin JAR changes)%n",
+            plugins.getPluginDir() != null && Files.isDirectory(plugins.getPluginDir()) ? "enabled" : "disabled");
         System.out.println();
         System.out.println("OpenAI-compatible:");
         System.out.printf("  GET  /v1/models             http://localhost:%d/v1/models%n", port);
@@ -340,6 +359,55 @@ public class ApiServer {
 
     private static String pathToLabel(String path) {
         return path.replaceFirst("^/", "").replace('/', '_').replace('-', '_');
+    }
+
+    // ── Plugin directory watcher ─────────────────────────────────────────────
+
+    /**
+     * Starts a daemon thread that watches the plugin directory and calls
+     * {@link PluginManager#load()} whenever a JAR is added, changed, or removed —
+     * so dropping in a rebuilt plugin JAR during development takes effect without
+     * restarting the server. No-op if there is no plugin directory to watch.
+     */
+    private void startPluginWatcher() {
+        Path dir = plugins.getPluginDir();
+        if (dir == null || !Files.isDirectory(dir)) return;
+
+        Thread t = new Thread(() -> watchPluginDir(dir), "jllm-plugin-watcher");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void watchPluginDir(Path dir) {
+        try (WatchService ws = dir.getFileSystem().newWatchService()) {
+            dir.register(ws, StandardWatchEventKinds.ENTRY_CREATE,
+                              StandardWatchEventKinds.ENTRY_MODIFY,
+                              StandardWatchEventKinds.ENTRY_DELETE);
+            while (true) {
+                WatchKey key = ws.take(); // blocks until something changes
+
+                // Plugin JARs are often written in several steps (copy, then
+                // rename); wait briefly and drain the burst before reloading
+                // so we don't reload mid-copy on a half-written file.
+                Thread.sleep(300);
+                key.pollEvents();
+                boolean valid = key.reset();
+
+                try {
+                    plugins.load();
+                    LOG.info("Plugin directory changed — reloaded: {} tool(s), {} interceptor(s)",
+                            plugins.getTools().size(), plugins.getInterceptors().size());
+                } catch (Exception e) {
+                    LOG.warn("Plugin auto-reload failed: {}", e.getMessage());
+                }
+
+                if (!valid) break; // directory itself is no longer accessible
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            LOG.warn("Plugin directory watcher stopped: {}", e.getMessage());
+        }
     }
 
     /**
@@ -985,6 +1053,44 @@ public class ApiServer {
             model.setGgufBlockCount(m.blockCount);
             model.setGgufEmbeddingLength(m.embeddingLength);
         } catch (Exception ignored) {}
+    }
+
+    // ── Plugins: GET /api/plugins ─────────────────────────────────────────────
+
+    private void handlePlugins(HttpServerExchange ex) throws Exception {
+        sendJson(ex, 200, pluginsSummary());
+    }
+
+    // ── Plugins: POST /api/plugins/reload ─────────────────────────────────────
+
+    /**
+     * Rescans the plugin directory and reloads all tools/interceptors in place.
+     * Lets a developer drop a new/updated plugin JAR into the plugin directory
+     * and pick it up without restarting the server (and losing loaded models,
+     * the context pool, etc).
+     */
+    private void handlePluginsReload(HttpServerExchange ex) throws Exception {
+        plugins.load();
+        LOG.info("Plugins reloaded via API: {} tool(s), {} interceptor(s)",
+                plugins.getTools().size(), plugins.getInterceptors().size());
+        sendJson(ex, 200, pluginsSummary());
+    }
+
+    private Map<String, Object> pluginsSummary() {
+        List<Map<String, Object>> tools = new ArrayList<>();
+        for (LlmTool t : plugins.getTools()) {
+            tools.add(map("name", t.getName(), "description", t.getDescription(),
+                           "source", plugins.getSourceJar(t)));
+        }
+        List<Map<String, Object>> interceptors = new ArrayList<>();
+        for (PromptInterceptor ic : plugins.getInterceptors()) {
+            interceptors.add(map("priority", ic.getPriority(), "source", plugins.getSourceJar(ic)));
+        }
+        return map(
+            "plugin_dir",   plugins.getPluginDir() != null ? plugins.getPluginDir().toString() : null,
+            "tools",        tools,
+            "interceptors", interceptors
+        );
     }
 
     // ── OpenAI: GET /v1/models ────────────────────────────────────────────────
