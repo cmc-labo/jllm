@@ -8,7 +8,7 @@ Models are registered by pointing to a local GGUF file. The registry is stored i
 
 Both `run` (interactive chat) and `serve` (HTTP API server) run inference in-process via a JNI binding to llama.cpp — no `llama-cli` subprocess required. If the JNI native library is not available, `run` falls back to a `llama-cli` subprocess automatically.
 
-The tool is extensible: drop a JAR into `~/.local-llm/plugins/` to add new **function-calling tools** or **prompt interceptors** without rebuilding the application.
+The tool is extensible: drop a JAR into `~/.local-llm/plugins/` to add new **function-calling tools** or **prompt interceptors** without rebuilding the application. ⚠️ Plugin JARs run as fully trusted code with no sandboxing — only install plugins you wrote yourself or otherwise trust (see [Plugin security](#plugin-security)).
 
 RAG (Retrieval-Augmented Generation) is built in: index local PDFs and text files with `jllm rag add`, then pass `--rag <collection>` to `jllm run` or include `"rag_collection"` in any API request. Retrieval runs entirely on-device via an embedded [Apache Lucene](https://lucene.apache.org/) index — no embedding model, no external server, no network required.
 
@@ -806,6 +806,37 @@ Two plugin types are available:
 | **Tool** | `LlmTool` | Function-calling tool the model can invoke during a conversation |
 | **Interceptor** | `PromptInterceptor` | Transforms the assembled ChatML prompt before each generation call |
 
+### Plugin security
+
+**Plugin JARs are fully trusted code, not a sandbox.** Each JAR is loaded into its own
+`URLClassLoader`, but that only isolates class *namespaces* so plugins with clashing class
+names don't collide — it is **not** a security boundary. A loaded plugin runs with the exact
+same OS-level privileges as the `jllm` process itself: it can read/write any file the current
+user can access, open network connections, spawn subprocesses, exfiltrate the contents of
+`~/.local-llm/` (including registered model paths and RAG-indexed documents), etc. There is
+currently no permission model, no capability restriction, and no `SecurityManager`-style
+enforcement.
+
+Consequences to keep in mind:
+
+- **Only install plugin JARs you wrote yourself or fully trust the source of.** Treat a
+  third-party plugin JAR the same as any other unreviewed native binary or shell script —
+  do not run one you downloaded without reading (or at least decompiling) it first.
+- `LlmTool.execute()` results are typically also fed back into the model's context — a
+  malicious or buggy tool can inject arbitrary text into the conversation, not just read data.
+- In `jllm serve` mode, a plugin fault or malicious `Runtime.exit()`/OOM can take down the
+  whole server process (and any other model/RAG state it holds), since there's no process
+  isolation between plugins and the host application.
+- The plugin directory (`~/.local-llm/plugins/`) is watched for changes and reloaded
+  automatically (see [Hot reload](#hot-reload)) — anything with write access to that directory
+  (another local user, a compromised build script, a `chmod`-permissive shared mount, etc.) can
+  get code executed inside `jllm serve` without any further confirmation. Keep that directory's
+  permissions as restrictive as the rest of `~/.local-llm/`.
+
+A real permission/capability model (e.g. restricting plugins to a declared set of
+filesystem/network capabilities, or running them out-of-process) is a reasonable direction for
+the future, but is **not implemented today** — the above is the actual, current trust boundary.
+
 ### Listing loaded plugins
 
 ```bash
@@ -825,6 +856,28 @@ Interceptors (1):
   ----------------------------------------------------------------------
   100       LoggingInterceptor                        logging-plugin.jar
 ```
+
+### Hot reload
+
+Rebuilding a plugin JAR during development no longer requires restarting jllm:
+
+- **`jllm run` (interactive):** type `/reload-plugins` at the chat prompt to rescan
+  `~/.local-llm/plugins/` and pick up the new/updated JAR mid-session.
+- **`jllm serve`:** the plugin directory is watched automatically (`WatchService`) and
+  reloaded in place — with no downtime and without dropping loaded models, the context pool,
+  or in-flight requests — whenever a JAR is added, changed, or removed. You can also trigger
+  it manually:
+  ```bash
+  curl -X POST http://localhost:11434/api/plugins/reload
+  curl http://localhost:11434/api/plugins   # inspect what's currently loaded
+  ```
+- **`jllm plugins reload`:** reloads plugins for that one-shot CLI invocation (mostly useful
+  to sanity-check a JAR loads without errors before dropping it somewhere a live process
+  watches it).
+
+Because this makes the plugin directory a live input to running processes, its trust
+implications are the same ones described in [Plugin security](#plugin-security) above —
+review before you enable, and don't grant unrelated users or processes write access to it.
 
 ### How tool calling works
 

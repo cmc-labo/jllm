@@ -24,6 +24,12 @@ package dev.localllm.plugin;
  * <h2>Thread safety</h2>
  * Each loaded tool instance is shared across all concurrent requests in the
  * HTTP server mode. Implementations must be thread-safe.
+ *
+ * <h2>Security</h2>
+ * Tool JARs run fully trusted, with no sandboxing — see
+ * {@link PluginManager} for details. Only implement/install tools you trust,
+ * and treat {@link #execute} arguments as untrusted input (they come from the
+ * model, which in turn may be echoing untrusted user input).
  */
 public interface LlmTool {
 

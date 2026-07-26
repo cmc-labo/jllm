@@ -22,6 +22,11 @@ package dev.localllm.plugin;
  * <h2>Thread safety</h2>
  * A single interceptor instance may be called from multiple threads
  * concurrently in server mode. Implementations must be thread-safe.
+ *
+ * <h2>Security</h2>
+ * Interceptor JARs run fully trusted, with no sandboxing — see
+ * {@link PluginManager} for details. Only install interceptors you trust; a
+ * malicious one sees (and can rewrite) every prompt sent to the model.
  */
 public interface PromptInterceptor {
 

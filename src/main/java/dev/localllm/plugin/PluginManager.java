@@ -29,6 +29,18 @@ import java.util.ServiceLoader;
  *
  * <p>{@link #load()} is idempotent: calling it again clears and reloads all
  * plugins (useful for hot-reload during development).
+ *
+ * <h2>Security</h2>
+ * Each JAR gets its own {@link URLClassLoader} only to isolate class
+ * <em>namespaces</em> (so unrelated plugins with clashing class names don't
+ * collide) — this is <b>not</b> a sandbox. Loaded plugin code runs fully
+ * trusted, with the same OS-level privileges as the host process: unrestricted
+ * filesystem access, network access, ability to spawn subprocesses, etc. There
+ * is no permission model or capability restriction. Only point {@code pluginDir}
+ * at a directory containing JARs you trust; anyone who can write into it can get
+ * arbitrary code executed inside this process the next time {@link #load()} runs
+ * (including via the directory watchers that call it automatically in
+ * {@code jllm serve}).
  */
 public class PluginManager {
 

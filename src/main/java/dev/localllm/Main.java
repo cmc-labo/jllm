@@ -729,6 +729,10 @@ public class Main {
             System.out.println("  1. Implement LlmTool or PromptInterceptor (see examples/plugins/)");
             System.out.println("  2. Add META-INF/services/dev.localllm.plugin.<Interface> to your JAR");
             System.out.println("  3. Drop the JAR into: " + pluginDir);
+            System.out.println();
+            System.out.println("Caution: plugin JARs run fully trusted, with no sandboxing — they get the");
+            System.out.println("same OS-level access as the jllm process itself. Only install plugins you");
+            System.out.println("wrote yourself or fully trust. See 'Plugin security' in README.md.");
             return;
         }
 
