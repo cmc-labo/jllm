@@ -483,12 +483,12 @@ public class ModelRunner {
 
     private static void printHelp(PluginManager pm) {
         System.out.println();
-        System.out.println("  /clear         Clear conversation history and start fresh");
-        System.out.println("  /save [file]   Save conversation log to a Markdown file");
-        System.out.println("                   (defaults to jllm-chat-YYYYMMDD-HHmmss.md)");
-        System.out.println("  /reload-plugins  Rescan the plugin directory and reload tools/interceptors");
-        System.out.println("  /help          Show this message");
-        System.out.println("  /quit          Exit the chat  (also: /exit, /bye, Ctrl+D)");
+        System.out.printf("  %-17s%s%n", "/clear",           "Clear conversation history and start fresh");
+        System.out.printf("  %-17s%s%n", "/save [file]",     "Save conversation log to a Markdown file");
+        System.out.println("                     (defaults to jllm-chat-YYYYMMDD-HHmmss.md)");
+        System.out.printf("  %-17s%s%n", "/reload-plugins",  "Rescan the plugin directory and reload tools/interceptors");
+        System.out.printf("  %-17s%s%n", "/help",            "Show this message");
+        System.out.printf("  %-17s%s%n", "/quit",            "Exit the chat  (also: /exit, /bye, Ctrl+D)");
         if (pm.hasTools()) {
             System.out.println();
             System.out.println("  Loaded tools:");
