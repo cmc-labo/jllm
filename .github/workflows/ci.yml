@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 11 is the minimum supported version (see README); 21 also exercises
+        # the virtual-threads code path in the HTTP server.
+        java: ['11', '21']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      # Dependency JARs are pinned by version in build.sh, so caching on its
+      # checksum is safe and avoids re-downloading them from Maven Central on
+      # every run.
+      - name: Cache downloaded dependency JARs
+        uses: actions/cache@v4
+        with:
+          path: lib
+          key: ${{ runner.os }}-jllm-lib-${{ hashFiles('build.sh', 'test.sh') }}
+
+      - name: Build (build.sh)
+        run: bash build.sh
+
+      - name: Run JUnit tests (test.sh)
+        run: bash test.sh
+
+      - name: Smoke-test the packaged CLI jar
+        run: |
+          java -jar target/local-llm.jar version
+          java -jar target/local-llm.jar list

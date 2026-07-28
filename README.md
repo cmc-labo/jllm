@@ -35,6 +35,19 @@ mvn package
 
 Output: `target/local-llm.jar`
 
+## Testing
+
+Unit tests cover the pure-logic pieces (Modelfile parsing, RAG chunking/rank fusion, etc.)
+using JUnit 5, run via the standalone console launcher — no Maven required, matching `build.sh`:
+
+```bash
+bash build.sh   # test.sh reuses target/classes and lib/ from this
+bash test.sh
+```
+
+CI (`.github/workflows/ci.yml`) runs both on every push/PR against JDK 11 and 21, then does a
+minimal smoke test of the packaged jar (`jllm version`, `jllm list`).
+
 ## The `jllm` wrapper
 
 A thin shell wrapper is provided so you don't have to type `java -jar target/local-llm.jar` every time:
