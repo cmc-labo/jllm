@@ -1,8 +1,10 @@
 # llama.cpp checkout (cloned by hand, see README) and its build output
 /llama.cpp/
 
-# native JNI build output
+# native JNI build output (dev build, and --static's per-classifier build dirs/output)
 /native/build/
+/native/build-*/
+/native/dist/
 
 # Java build output
 /target/

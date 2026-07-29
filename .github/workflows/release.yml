@@ -1,0 +1,118 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g.:
+#   git tag v0.2.0 && git push origin v0.2.0
+# workflow_dispatch lets you re-run the same build manually (e.g. to test
+# this workflow itself) without having to push a new tag.
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to create the GitHub Release and upload assets
+
+env:
+  # Pinned to the exact commit the vendored native/llama_jni.cpp was written
+  # and tested against (see README > JNI Binding). llama.cpp's C API shifts
+  # over time, so building against an arbitrary "latest" checkout risks a
+  # native/build.sh --static failure or a subtly broken build. Bump this only
+  # after confirming native/build.sh --static still succeeds against the new
+  # commit, on every platform below.
+  LLAMA_CPP_REF: 6f1034b32af66d3efa2a572a386cc9bccb01ba55
+
+jobs:
+  # Builds the self-contained (statically-linked) libllamajni for one
+  # platform and uploads it as a build artifact for the packaging job below.
+  #
+  # Only CPU-only Linux/macOS variants are built here. Windows is not
+  # supported: native/llama_jni.cpp's crash guard depends on POSIX
+  # sigaction()/SA_ONSTACK, which has no Windows equivalent, so it does not
+  # compile there without a real portability effort. GPU variants (cuda,
+  # rocm, metal) are likewise skipped — they need toolchains/hardware this
+  # workflow's plain GitHub-hosted runners don't have.
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout jllm
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Not a git submodule (see .gitignore) — cloned fresh here, same as a
+      # local dev setup would (see README > JNI Binding), pinned for
+      # reproducibility (see LLAMA_CPP_REF above).
+      - name: Checkout pinned llama.cpp
+        run: |
+          git init llama.cpp
+          cd llama.cpp
+          git remote add origin https://github.com/ggerganov/llama.cpp.git
+          git fetch --depth 1 origin "$LLAMA_CPP_REF"
+          git checkout FETCH_HEAD
+
+      - name: Compile Java sources (build.sh)
+        run: bash build.sh
+
+      - name: Generate JNI headers
+        run: |
+          mkdir -p jni-headers
+          javac -h jni-headers -d target/classes \
+              -cp "$(ls lib/*.jar | tr '\n' ':')" \
+              src/main/java/dev/localllm/jni/*.java
+
+      - name: Build static libllamajni (native/build.sh --static)
+        run: bash native/build.sh --static
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-dist-${{ matrix.os }}
+          path: native/dist
+          if-no-files-found: error
+
+  # Bundles every platform's native library (downloaded from the matrix jobs
+  # above) into one fat JAR and publishes it to the GitHub Release for this
+  # tag, so a user can `java -jar jllm.jar ...` immediately — no cmake,
+  # compiler, or llama.cpp checkout required on their machine.
+  package-release:
+    needs: build-native
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout jllm
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download all native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-dist-*
+          path: native/dist
+          merge-multiple: true
+
+      - name: Build fat JAR (build.sh)
+        run: bash build.sh
+
+      - name: Rename jar for release
+        run: cp target/local-llm.jar "jllm-${{ github.ref_name }}.jar"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: jllm-${{ github.ref_name }}.jar
+          generate_release_notes: true

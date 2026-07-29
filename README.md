@@ -19,6 +19,23 @@ RAG (Retrieval-Augmented Generation) is built in: index local PDFs and text file
 - For in-process inference: a built `libllamajni.so` (see [JNI Binding](#jni-binding-devlocalllmjni))
 - For `run` subprocess fallback only: [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-cli` binary)
 
+## Download a pre-built jar
+
+The [Releases page](https://github.com/cmc-labo/jllm/releases) publishes a fat JAR with
+`libllamajni` already bundled for Linux (x86_64) and macOS (Apple Silicon) — CPU-only, no
+GPU variant. If your platform is one of those, this is the fastest way to get started; skip
+straight to [Usage](#usage):
+
+```bash
+curl -fsSL -o jllm.jar https://github.com/cmc-labo/jllm/releases/latest/download/jllm-<version>.jar
+java -jar jllm.jar version   # confirms "JNI: available" with no separate build step
+```
+
+Windows and GPU builds (CUDA/ROCm/Metal) aren't published yet — see
+[`.github/workflows/release.yml`](.github/workflows/release.yml) for why (Windows needs a real
+portability fix, GPU variants need toolchains the release runners don't have). Build from
+source instead (below), or run in subprocess-fallback mode against your own `llama-cli`.
+
 ## Build
 
 **Without Maven** (recommended — downloads Gson, SLF4J, Logback, and Undertow automatically):
