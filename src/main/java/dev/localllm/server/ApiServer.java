@@ -471,16 +471,34 @@ public class ApiServer {
 
     private void handlePs(HttpServerExchange ex) throws Exception {
         ContextPool.PoolStats ps = contextPool.stats();
-        List<Map<String, Object>> models = new ArrayList<>();
+
+        // Idle-context-pool stats, grouped by model name — a model can have
+        // pooled contexts under several nCtx/nThreads configs at once.
+        Map<String, List<Map<String, Object>>> configsByModel = new LinkedHashMap<>();
+        Map<String, Integer> idleByModel = new LinkedHashMap<>();
         for (ContextPool.KeyStats ks : ps.byKey) {
             // key format: "modelName|nCtx|nThreads"
             String[] parts = ks.key.split("\\|", 3);
             String modelName = parts[0];
+            Map<String, Object> cfgEntry = new LinkedHashMap<>();
+            cfgEntry.put("num_ctx",       parts.length > 1 ? parts[1] : "?");
+            cfgEntry.put("num_threads",   parts.length > 2 ? parts[2] : "?");
+            cfgEntry.put("idle_contexts", ks.idleContexts);
+            configsByModel.computeIfAbsent(modelName, k -> new ArrayList<>()).add(cfgEntry);
+            idleByModel.merge(modelName, ks.idleContexts, Integer::sum);
+        }
+
+        // One row per model actually resident in memory (loadedModels is the
+        // source of truth). Using the context pool alone would miss a model
+        // whose contexts are all currently checked out (e.g. every slot busy
+        // serving a request) — idle_contexts would read 0, but the model is
+        // very much loaded and in use.
+        List<Map<String, Object>> models = new ArrayList<>();
+        for (String modelName : loadedModels.keySet()) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("name",          modelName);
-            entry.put("idle_contexts", ks.idleContexts);
-            entry.put("num_ctx",       parts.length > 1 ? parts[1] : "?");
-            entry.put("num_threads",   parts.length > 2 ? parts[2] : "?");
+            entry.put("idle_contexts", idleByModel.getOrDefault(modelName, 0));
+            entry.put("configs",       configsByModel.getOrDefault(modelName, Collections.emptyList()));
             ModelConfig cfg = registry.get(modelName).orElse(null);
             if (cfg != null) entry.put("size_bytes", cfg.getSizeBytes());
             models.add(entry);

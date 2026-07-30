@@ -18,18 +18,31 @@ import dev.localllm.rag.RagResult;
 import dev.localllm.runner.ModelRunner;
 import dev.localllm.server.ApiServer;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
 import java.io.InputStream;
+import java.net.ConnectException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 public class Main {
@@ -66,6 +79,7 @@ public class Main {
             case "info":    cmdInfo(args);      break;
             case "storage": cmdStorage();       break;
             case "plugins": cmdPlugins(args);   break;
+            case "ps":      cmdPs(args);        break;
             case "update":  cmdUpdate(args);    break;
             case "verify":  cmdVerify(args);    break;
             case "version": cmdVersion();       break;
@@ -567,6 +581,83 @@ public class Main {
         }
         System.out.println("Starting local-llm server on http://localhost:" + port);
         new ApiServer(port, registry, plugins, ragManager, maxConcurrent, cfg).start();
+    }
+
+    /**
+     * Show models currently loaded in memory by a running {@code jllm serve} process.
+     * Queries that server's {@code GET /api/ps} over HTTP — there is no shared state
+     * between separate {@code jllm} invocations otherwise, since each CLI command runs
+     * in its own short-lived JVM.
+     */
+    private static void cmdPs(String[] args) throws Exception {
+        int port = 11434;
+        for (int i = 1; i < args.length; i++) {
+            switch (args[i]) {
+                case "--port":
+                    if (i + 1 < args.length) port = Integer.parseInt(args[++i]); break;
+                default:
+                    System.err.println("Unknown flag: " + args[i]);
+                    System.err.println("Usage: jllm ps [--port <port>]");
+                    System.exit(1);
+            }
+        }
+
+        HttpClient http = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(3))
+                .build();
+        HttpRequest req = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/ps"))
+                .GET()
+                .timeout(Duration.ofSeconds(10))
+                .build();
+
+        HttpResponse<String> resp;
+        try {
+            resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        } catch (ConnectException | HttpConnectTimeoutException e) {
+            System.err.println("No jllm serve process found on port " + port + " (connection refused).");
+            System.err.println("Start one with: jllm serve" + (port != 11434 ? " --port " + port : ""));
+            System.exit(1);
+            return;
+        }
+        if (resp.statusCode() != 200) {
+            System.err.println("Error: server returned HTTP " + resp.statusCode() + ": " + resp.body());
+            System.exit(1);
+            return;
+        }
+
+        JsonObject body = JsonParser.parseString(resp.body()).getAsJsonObject();
+        JsonArray models = body.getAsJsonArray("models");
+        JsonArray schedulers = body.has("batch_schedulers") ? body.getAsJsonArray("batch_schedulers") : new JsonArray();
+
+        if (models == null || models.isEmpty()) {
+            System.out.println("No models currently loaded on port " + port + ".");
+            return;
+        }
+
+        // Sum active_sequences/pending_requests per model name across every
+        // (num_ctx, num_threads) tuple that model has an active scheduler for.
+        Map<String, Integer> activeByModel  = new LinkedHashMap<>();
+        Map<String, Integer> pendingByModel = new LinkedHashMap<>();
+        for (int i = 0; i < schedulers.size(); i++) {
+            JsonObject s = schedulers.get(i).getAsJsonObject();
+            String name = s.get("name").getAsString();
+            activeByModel.merge(name, s.get("active_sequences").getAsInt(), Integer::sum);
+            pendingByModel.merge(name, s.get("pending_requests").getAsInt(), Integer::sum);
+        }
+
+        System.out.printf("%-25s %-10s %-10s %-11s %s%n",
+                "NAME", "SIZE", "IDLE CTX", "ACTIVE SEQ", "PENDING");
+        System.out.println("-".repeat(65));
+        for (int i = 0; i < models.size(); i++) {
+            JsonObject m = models.get(i).getAsJsonObject();
+            String name = m.get("name").getAsString();
+            String size = m.has("size_bytes") ? formatSize(m.get("size_bytes").getAsLong()) : "-";
+            int idleCtx = m.has("idle_contexts") ? m.get("idle_contexts").getAsInt() : 0;
+            System.out.printf("%-25s %-10s %-10d %-11d %d%n",
+                    name, size, idleCtx,
+                    activeByModel.getOrDefault(name, 0),
+                    pendingByModel.getOrDefault(name, 0));
+        }
     }
 
     /**
@@ -1663,6 +1754,7 @@ public class Main {
         System.out.println("        [--max-body <bytes>]              Max request body size, e.g. 4M (default: 4M)");
         System.out.println("        [--max-tokens <n>]               Server-side output token cap, 0=off (default: 0)");
         System.out.println("        [--rate-limit <req/min>]          Per-IP rate limit, 0=off (default: 0)");
+        System.out.println("  ps [--port <port>]                      Show models currently loaded in a running 'jllm serve'");
         System.out.println("  rag add <collection> <path> [--embed-model <name>]");
         System.out.println("           [--chunk-size <words>] [--chunk-overlap <words>]");
         System.out.println("                                           Index a file or directory for RAG");

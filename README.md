@@ -1145,7 +1145,7 @@ handlers — both Ollama and OpenAI endpoints.
 | `POST` | `/api/generate`         | Ollama  | Text generation |
 | `POST` | `/api/chat`             | Ollama  | Chat completion |
 | `POST` | `/api/embeddings`       | Ollama  | Text embeddings |
-| `GET`  | `/api/ps`               | Ollama  | Context pool stats and idle context count |
+| `GET`  | `/api/ps`               | Ollama  | Models currently loaded in memory, plus context pool / batch scheduler activity |
 | `POST` | `/api/pull`             | Management | Download from HuggingFace and register (NDJSON stream) |
 | `POST` | `/api/create`           | Management | Create model from inline Modelfile (NDJSON stream) |
 | `POST` | `/api/copy`             | Management | Copy a registry entry to a new name |
@@ -1470,7 +1470,14 @@ curl http://localhost:11434/api/ps
 
 ```json
 {
-  "models": [],
+  "models": [
+    {
+      "name": "phi3:mini",
+      "idle_contexts": 0,
+      "configs": [],
+      "size_bytes": 2176063488
+    }
+  ],
   "batch_schedulers": [
     {
       "name": "phi3:mini",
@@ -1490,14 +1497,17 @@ curl http://localhost:11434/api/ps
 }
 ```
 
-In JNI mode:
-- **`batch_schedulers`** — one entry per active `(model, num_ctx, num_threads)` tuple. `active_sequences` is the number of requests currently being decoded; `pending_requests` is the number queued waiting for a slot.
-- **`models`** — empty (ContextPool is not used in JNI mode).
-
-In fallback (no JNI) mode:
-- **`models`** — one entry per idle context; `idle_contexts` is the number of pooled contexts ready to reuse.
-- **`batch_schedulers`** — empty.
-- **`pool_stats`** — `hit_rate` is the fraction of requests that reused a pooled context.
+- **`models`** — one entry per model whose weights are currently loaded in memory (this is
+  `jllm ps`'s data source), regardless of JNI vs. fallback mode. `idle_contexts` and `configs`
+  are populated only in fallback mode (see below); in JNI mode they're always `0`/`[]` since
+  the `ContextPool` isn't used there — use `batch_schedulers` for JNI-mode activity instead.
+- **`batch_schedulers`** (JNI mode only) — one entry per active `(model, num_ctx, num_threads)`
+  tuple. `active_sequences` is the number of requests currently being decoded; `pending_requests`
+  is the number queued waiting for a slot.
+- **`pool_stats`** / per-model `configs[].idle_contexts` (fallback mode only) — `idle_contexts`
+  is the number of pooled contexts ready to reuse for that `(num_ctx, num_threads)` config;
+  `pool_stats.hit_rate` is the fraction of requests that reused a pooled context instead of
+  allocating a new one.
 
 ### `GET /health` — Liveness check
 
