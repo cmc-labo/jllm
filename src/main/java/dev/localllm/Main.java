@@ -647,7 +647,7 @@ public class Main {
 
         System.out.printf("%-25s %-10s %-10s %-11s %s%n",
                 "NAME", "SIZE", "IDLE CTX", "ACTIVE SEQ", "PENDING");
-        System.out.println("-".repeat(65));
+        System.out.println("-".repeat(67));
         for (int i = 0; i < models.size(); i++) {
             JsonObject m = models.get(i).getAsJsonObject();
             String name = m.get("name").getAsString();
