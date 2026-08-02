@@ -285,6 +285,7 @@ public class ApiServer {
         System.out.println();
         System.out.println("Ollama-compatible:");
         System.out.printf("  GET  /api/tags              http://localhost:%d/api/tags%n", port);
+        System.out.printf("  GET  /api/ps                http://localhost:%d/api/ps%n", port);
         System.out.printf("  POST /api/show              http://localhost:%d/api/show%n", port);
         System.out.printf("  POST /api/generate          http://localhost:%d/api/generate%n", port);
         System.out.printf("  POST /api/chat              http://localhost:%d/api/chat%n", port);
