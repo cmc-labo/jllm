@@ -96,6 +96,7 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `update <name> [flags]` | Modify registered model parameters in place without re-registering |
 | `run <name> [flags]` | Interactive REPL **or** non-interactive one-shot (pipe-friendly) |
 | `serve [--port <port>] [--max-concurrent <n>]` | Start the HTTP API server (default port: 11434) |
+| `ps [--port <port>]` | Show models currently loaded in memory by a running `jllm serve` |
 | `rag add <collection> <path>` | Index a file or directory into a RAG collection |
 | `rag list` | List all RAG collections with chunk counts |
 | `rag search <collection> <query>` | Test retrieval (shows top chunks and BM25 scores) |
@@ -104,6 +105,7 @@ All examples below use `jllm`. Substitute `java -jar target/local-llm.jar` if yo
 | `show <name> [--yaml]` | Print the model's config (Modelfile or Jllmfile format) |
 | `info <name>` | Show model details (includes SHA-256 and GGUF metadata) |
 | `plugins` | List all loaded plugin tools and interceptors |
+| `plugins reload` | Rescan the plugin directory for this CLI process |
 | `version` | Show jllm version, runtime, and dependency info |
 
 ### `pull` — Download from HuggingFace
