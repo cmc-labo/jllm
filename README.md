@@ -350,6 +350,29 @@ On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project L
 
 **Fallback (no JNI):** If the native library is not available, inference falls back to the `ContextPool` path: `LlamaContext` instances are pooled and reused across requests, one request active per context at a time. The pool holds up to `--max-concurrent` idle contexts per model configuration.
 
+### `ps` — Show models currently loaded in memory
+
+```bash
+jllm ps
+jllm ps --port 8080   # match a non-default 'jllm serve --port' value
+```
+
+```
+NAME                      SIZE       IDLE CTX   ACTIVE SEQ  PENDING
+-------------------------------------------------------------------
+phi3:mini                 2.0 GB     0          1           0
+```
+
+Each `jllm` invocation is its own short-lived JVM, so there's no state to share between
+separate CLI calls — `ps` queries a running `jllm serve` process's `GET /api/ps` over HTTP
+instead. If nothing is listening on that port, it fails fast with a clear message rather than
+hanging:
+
+```
+No jllm serve process found on port 11434 (connection refused).
+Start one with: jllm serve
+```
+
 ### `version` — Show environment info
 
 ```bash
