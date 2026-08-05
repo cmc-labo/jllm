@@ -84,6 +84,11 @@ public class Main {
             case "verify":  cmdVerify(args);    break;
             case "version": cmdVersion();       break;
             case "pull":    cmdPull(args);      break;
+            case "help":
+            case "-h":
+            case "--help":  printUsage();       break;
+            case "-v":
+            case "--version": cmdVersion();     break;
             default:
                 System.err.println("Unknown command: " + cmd);
                 printUsage();
