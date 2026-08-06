@@ -596,13 +596,16 @@ public class Main {
      */
     private static void cmdPs(String[] args) throws Exception {
         int port = 11434;
+        boolean json = false;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
                 case "--port":
                     if (i + 1 < args.length) port = Integer.parseInt(args[++i]); break;
+                case "--json":
+                    json = true; break;
                 default:
                     System.err.println("Unknown flag: " + args[i]);
-                    System.err.println("Usage: jllm ps [--port <port>]");
+                    System.err.println("Usage: jllm ps [--port <port>] [--json]");
                     System.exit(1);
             }
         }
@@ -627,6 +630,11 @@ public class Main {
         if (resp.statusCode() != 200) {
             System.err.println("Error: server returned HTTP " + resp.statusCode() + ": " + resp.body());
             System.exit(1);
+            return;
+        }
+
+        if (json) {
+            System.out.println(resp.body());
             return;
         }
 
@@ -1760,6 +1768,7 @@ public class Main {
         System.out.println("        [--max-tokens <n>]                Server-side output token cap, 0=off (default: 0)");
         System.out.println("        [--rate-limit <req/min>]          Per-IP rate limit, 0=off (default: 0)");
         System.out.println("  ps [--port <port>]                      Show models currently loaded in a running 'jllm serve'");
+        System.out.println("     [--json]                             Print raw JSON instead of a table");
         System.out.println("  rag add <collection> <path> [--embed-model <name>]");
         System.out.println("           [--chunk-size <words>] [--chunk-overlap <words>]");
         System.out.println("                                          Index a file or directory for RAG");

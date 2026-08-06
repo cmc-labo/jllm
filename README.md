@@ -355,6 +355,7 @@ On **Java 21+**, each HTTP request is handled on a **Virtual Thread** (Project L
 ```bash
 jllm ps
 jllm ps --port 8080   # match a non-default 'jllm serve --port' value
+jllm ps --json        # raw /api/ps response, for scripting (e.g. | jq)
 ```
 
 ```
