@@ -18,6 +18,7 @@ import dev.localllm.rag.RagResult;
 import dev.localllm.runner.ModelRunner;
 import dev.localllm.server.ApiServer;
 
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -67,7 +68,7 @@ public class Main {
 
         String cmd = args[0];
         switch (cmd) {
-            case "list":    cmdList();          break;
+            case "list":    cmdList(args);       break;
             case "add":     cmdAdd(args);       break;
             case "create":  cmdCreate(args);    break;
             case "rm":
@@ -98,8 +99,26 @@ public class Main {
 
     // ── commands ──────────────────────────────────────────────────────────────
 
-    private static void cmdList() {
+    private static void cmdList(String[] args) {
+        boolean json = false;
+        for (int i = 1; i < args.length; i++) {
+            switch (args[i]) {
+                case "--json":
+                    json = true; break;
+                default:
+                    System.err.println("Unknown flag: " + args[i]);
+                    System.err.println("Usage: jllm list [--json]");
+                    System.exit(1);
+            }
+        }
+
         List<ModelConfig> models = registry.list();
+
+        if (json) {
+            System.out.println(new GsonBuilder().setPrettyPrinting().create().toJson(models));
+            return;
+        }
+
         if (models.isEmpty()) {
             System.out.println("No models registered. Use 'add' or 'create' to register one.");
             return;
@@ -1728,7 +1747,7 @@ public class Main {
         System.out.println("Usage: java -jar local-llm.jar <command> [options]");
         System.out.println();
         System.out.println("Commands:");
-        System.out.println("  list                                    List registered models with disk status");
+        System.out.println("  list [--json]                           List registered models with disk status");
         System.out.println("  storage                                 Show per-model disk usage summary");
         System.out.println("  add <name> --path <path>                Register a model by file path");
         System.out.println("             [--binary <path>]            Path to llama.cpp binary");

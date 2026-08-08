@@ -808,6 +808,12 @@ The `SHARDS` column shows `-` for single-file models or the shard count for spli
 - `ok` — file exists on disk
 - `missing` — registered path no longer exists (stale entry)
 
+Pass `--json` for the raw registry entries instead of the table, for scripting (e.g. `jllm list --json | jq '.[].name'`):
+
+```bash
+jllm list --json
+```
+
 ### `jllm storage` — full disk usage view
 
 ```bash
